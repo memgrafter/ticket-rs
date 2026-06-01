@@ -191,3 +191,7 @@ Commit these files. Diff them. Review them. They're just text.
 ## Config / Directory resolution
 
 `tk` looks for `.tickets/` by walking up parent directories. Override with `TICKETS_DIR` env var. Run `tk create` from a project root to initialize `.tickets/` there — works from any subdirectory.
+
+## Credits
+
+- `ticket.ts` and interface based on https://github.com/wedow/ticket
