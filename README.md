@@ -9,25 +9,33 @@
 
 ## 5 Whys
 
-### Why tickets in markdown?
+### Why tickets?
 
-Because SQL schemas rot. When your ticket system is `cat .tickets/*.md | grep "status: open"`, there's nothing to migrate. No schema versioning. No vendor lock-in. Your tickets live in the repo, move with the repo, and diff like everything else.
+We need a place to organize work for the project. Written down, shared, ordered.
 
-### Why a CLI instead of a web UI?
+### Why markdown files?
 
-Because web UIs optimize for the 5% case — rich text editors, drag-and-drop boards, emoji reactions — and neglect the 95%: create, status, dependency, done. `tk` gives you the 95% in under 100ms with tab completion and `git log` integration.
+*"Ok, we need tickets. Why not put them in a database or a SaaS tool?"*
 
-### Why git-backed at all?
+Because every database needs a special client to read and write. A SaaS tool needs a login, a page load, and a network request. A markdown file doesn't need anything — it's just text. Works with any editor, any terminal. No setup, no login, no vendor, no network calls.
 
-Because **ticket state should follow code state**. When you `git checkout feature/foo`, the tickets for that feature should be right there. Code review includes the ticket. The CI pipeline can read `tk query '.status == "closed"'`. Everything stays in sync because it *can't* get out of sync.
+### Why stored in git?
 
-### Why dependency tracking in a ticket system?
+*"Ok, markdown files work — but why keep them in the repo specifically? They could just sit in a shared folder."*
 
-Because every real project has a critical path. `tk dep-tree` shows you exactly what's blocking what. `tk ready` tells you what you can pick up right now. `tk dep-cycle` catches circular reasoning before it ships. Spreadsheets don't do this. JIRA does it inside a modal inside a dashboard inside a ten-second load.
+Because tickets describe work that changes the code. If they're in a shared folder, they're disconnected — someone updates a ticket, someone else merges code, and nobody connects the two. In the repo, ticket changes are in the same commits as code changes. `git log` shows both. `git checkout` gives both. They don't drift because they can't drift.
 
-### Why Rust?
+### Why a CLI?
 
-Because a ticket system that takes 500ms to print "hello" is a ticket system you stop using. `ticket-rs` starts in under 10ms. Also: no runtime, no VM, one binary.
+*"Great, so there's a `.tickets/` folder in the repo. Why not just edit the files directly?"*
+
+A CLI gives coding agents, humans, and scripts a stable, discoverable interface. An agent doesn't know how to find the right YAML field and edit it in place — but it can run `tk close abc-123`. CI doesn't want to parse markdown frontmatter — it can run `tk query '.status == "closed"'` and get JSONL back. Tab completion discovers every command. `--help` documents every flag. The files are the source of truth, but the CLI is the API.
+
+### Why not use an existing CLI?
+
+*"There are a dozen issue trackers with CLIs. Linear has one. GitHub has `gh`. Why build another?"*
+
+Because every existing CLI assumes network access and an account on their platform. `gh issue create` requires authentication, API rate limits, and a working internet connection. This project's tickets are local files — they work in an offline checkout, in a CI container with no egress, in a `git clone` on a plane. The CLI is a thin wrapper over local files. No API, no auth, no dependency on an external service. It works when everything else is down.
 
 ---
 
