@@ -1,43 +1,6 @@
 # ticket-rs
 
-> You've already got the best issue tracker in the world: your git repo.  
-> Everything else is just a UI bolted on top of the same damn data model.
-
 **ticket-rs** keeps your tickets as plain markdown files next to your code — no database, no API, no login screen, no "we'll migrate you to our new platform next quarter." Track issues, deps, and blockers from your terminal with `tk create`, `tk dep`, `tk ready`, and get back to shipping.
-
----
-
-## 5 Whys
-
-### Why tickets?
-
-We need a place to organize work for the project. Written down, shared, ordered.
-
-### Why markdown files?
-
-*"Ok, we need tickets. Why not put them in a database or a SaaS tool?"*
-
-Because every database needs a special client to read and write. A SaaS tool needs a login, a page load, and a network request. A markdown file doesn't need anything — it's just text. Works with any editor, any terminal. No setup, no login, no vendor, no network calls.
-
-### Why stored in git?
-
-*"Ok, markdown files work — but why keep them in the repo specifically? They could just sit in a shared folder."*
-
-Because tickets describe work that changes the code. If they're in a shared folder, they're disconnected — someone updates a ticket, someone else merges code, and nobody connects the two. In the repo, ticket changes are in the same commits as code changes. `git log` shows both. `git checkout` gives both. They don't drift because they can't drift.
-
-### Why a CLI?
-
-*"Great, so there's a `.tickets/` folder in the repo. Why not just edit the files directly?"*
-
-A CLI gives coding agents, humans, and scripts a stable, discoverable interface. An agent doesn't know how to find the right YAML field and edit it in place — but it can run `tk close abc-123`. CI doesn't want to parse markdown frontmatter — it can run `tk query '.status == "closed"'` and get JSONL back. Tab completion discovers every command. `--help` documents every flag. The files are the source of truth, but the CLI is the API.
-
-### Why not use an existing CLI?
-
-*"There are a dozen issue trackers with CLIs. Linear has one. GitHub has `gh`. Why build another?"*
-
-Because every existing CLI assumes network access and an account on their platform. `gh issue create` requires authentication, API rate limits, and a working internet connection. This project's tickets are local files — they work in an offline checkout, in a CI container with no egress, in a `git clone` on a plane. The CLI is a thin wrapper over local files. No API, no auth, no dependency on an external service. It works when everything else is down.
-
----
 
 ## Install
 
@@ -117,8 +80,6 @@ tk dep-cycle
 
 Tickets live in `.tickets/<id>.md` — open them in any editor, commit them with `git add .tickets && git commit`.
 
----
-
 ## Shell integration (recommended)
 
 You can find tickets by partial ID — suffix, prefix, or substring:
@@ -131,7 +92,34 @@ tk show timeout    # substring match
 
 > **Note:** ambiguous partial IDs (multiple matches) produce an error.
 
----
+## Why tickets?
+
+We need a place to organize work for the project. Written down, shared, ordered.
+
+## Why markdown files?
+
+*"Ok, we need tickets. Why not put them in a database or a SaaS tool?"*
+
+Because every database needs a special client to read and write. A SaaS tool needs a login, a page load, and a network request. A markdown file doesn't need anything — it's just text. Works with any editor, any terminal. No setup, no login, no vendor, no network calls.
+
+## Why stored in git?
+
+*"Ok, markdown files work — but why keep them in the repo specifically? They could just sit in a shared folder."*
+
+Because tickets describe work that changes the code. If they're in a shared folder, they're disconnected — someone updates a ticket, someone else merges code, and nobody connects the two. In the repo, ticket changes are in the same commits as code changes. `git log` shows both. `git checkout` gives both. They don't drift because they can't drift.
+
+## Why a CLI?
+
+*"Great, so there's a `.tickets/` folder in the repo. Why not just edit the files directly?"*
+
+A CLI gives coding agents, humans, and scripts a stable, discoverable interface. An agent doesn't know how to find the right YAML field and edit it in place — but it can run `tk close abc-123`. CI doesn't want to parse markdown frontmatter — it can run `tk query '.status == "closed"'` and get JSONL back. Tab completion discovers every command. `--help` documents every flag. The files are the source of truth, but the CLI is the API.
+
+## Why not use an existing CLI?
+
+*"There are a dozen issue trackers with CLIs. Linear has one. GitHub has `gh`. Why build another?"*
+
+Because every existing CLI assumes network access and an account on their platform. `gh issue create` requires authentication, API rate limits, and a working internet connection. This project's tickets are local files — they work in an offline checkout, in a CI container with no egress, in a `git clone` on a plane. The CLI is a thin wrapper over local files. No API, no auth, no dependency on an external service. It works when everything else is down.
+
 
 ## Data model
 
@@ -162,8 +150,6 @@ Started on the color palette.
 
 Commit these files. Diff them. Review them. They're just text.
 
----
-
 ## All commands
 
 | Command | Args | What it does |
@@ -185,8 +171,6 @@ Commit these files. Diff them. Review them. They're just text.
 | `query [.field=="val"]` | | JSONL output with optional filter |
 | `dep-tree <id>` | `--full` | Box-drawing dependency tree |
 | `dep-cycle` | | Find cycles (open tickets only) |
-
----
 
 ## Config / Directory resolution
 
