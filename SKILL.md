@@ -77,4 +77,6 @@ tk query '.status == "open" and .deps != []'
 
 `.tickets/` folder in the project root. Each ticket is `<id>.md` with YAML frontmatter. `tk` walks parent dirs to find it. No database, no server, no env setup — just a binary on `$PATH`.
 
+- **To put a ticket in another project, you must `cd` to that directory first** — `tk` walks up from the current working directory to find the nearest `.tickets/`, so it always writes to whichever repo's `.tickets/` it finds in its ancestor chain.
+
 **Cost**: One `cargo build --release` + copy binary. **Benefit**: Tickets in the repo, work offline, zero setup for any agent or script.
