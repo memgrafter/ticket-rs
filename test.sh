@@ -15,7 +15,7 @@ echo ""
 case "$MODE" in
     --all|-a|full)
         echo "--- Unit tests (bin) ---"
-        cargo test --bin ticket-rs 2>&1
+        cargo test --bin tk 2>&1
         echo ""
         echo "--- Integration tests ---"
         cargo test --test integration 2>&1
@@ -35,7 +35,7 @@ case "$MODE" in
         echo "--- Unit tests (quick) ---"
         echo "Run ./test.sh --all for full suite (unit + integration + clippy)"
         echo ""
-        cargo test --bin ticket-rs 2>&1
+        cargo test --bin tk 2>&1
         ;;
 esac
 

@@ -15,7 +15,7 @@ fn binary_path() -> PathBuf {
     // Use CARGO_MANIFEST_DIR to find it.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let target_dir = manifest_dir.join("target").join("debug");
-    target_dir.join("ticket-rs")
+    target_dir.join("tk")
 }
 
 /// Helper to run the ticket binary with args in a given working directory.
