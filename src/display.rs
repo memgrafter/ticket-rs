@@ -8,13 +8,13 @@
 
 use crate::graph::DependencyGraph;
 use crate::storage::Ticket;
-use crate::types::Status;
 use std::collections::HashMap;
 
 /// Format a ticket for display (like `tk show`).
 pub fn format_ticket_show(
     ticket: &Ticket,
-    statuses: &HashMap<String, Status>,
+    open: &HashMap<String, bool>,
+    statuses: &HashMap<String, String>,
     titles: &HashMap<String, String>,
     graph: &DependencyGraph,
     all_tickets: &[Ticket],
@@ -23,10 +23,8 @@ pub fn format_ticket_show(
 
     // Frontmatter with enhanced fields
     out.push_str(&format!("id: {}\n", ticket.metadata.id));
-    out.push_str(&format!(
-        "status: {}\n",
-        format_status(&ticket.metadata.status)
-    ));
+    out.push_str(&format!("status: {}\n", ticket.metadata.status));
+    out.push_str(&format!("open: {}\n", ticket.metadata.open));
     out.push_str(&format!(
         "deps: {}\n",
         format_id_list(&ticket.metadata.deps, titles)
@@ -36,10 +34,7 @@ pub fn format_ticket_show(
         format_id_list(&ticket.metadata.links, titles)
     ));
     out.push_str(&format!("created: {}\n", ticket.metadata.created));
-    out.push_str(&format!(
-        "type: {}\n",
-        format_ticket_type(&ticket.metadata.metadata_type)
-    ));
+    out.push_str(&format!("type: {}\n", ticket.metadata.metadata_type));
     out.push_str(&format!(
         "priority: {}\n",
         ticket.metadata.priority.to_u8()
@@ -83,11 +78,11 @@ pub fn format_ticket_show(
     }
 
     // Blockers section
-    let blockers = graph.blockers(&ticket.metadata.id, statuses);
+    let blockers = graph.blockers(&ticket.metadata.id, open);
     if !blockers.is_empty() {
         out.push_str("\n## Blockers\n");
         for b in &blockers {
-            let s = statuses.get(b).map(|s| format_status(s)).unwrap_or_default();
+            let s = statuses.get(b).map(|s| s.as_str()).unwrap_or_default();
             let t = titles.get(b).map(|t| t.as_str()).unwrap_or("(not found)");
             out.push_str(&format!("- {} [{}] {}\n", b, s, t));
         }
@@ -97,7 +92,7 @@ pub fn format_ticket_show(
     let blocking = graph.blocking(&ticket.metadata.id, all_tickets);
     let open_blocking: Vec<&Ticket> = blocking
         .into_iter()
-        .filter(|t| t.metadata.status != Status::Closed)
+        .filter(|t| t.metadata.open)
         .collect();
     if !open_blocking.is_empty() {
         out.push_str("\n## Blocking\n");
@@ -105,7 +100,7 @@ pub fn format_ticket_show(
             out.push_str(&format!(
                 "- {} [{}] {}\n",
                 t.metadata.id,
-                format_status(&t.metadata.status),
+                t.metadata.status,
                 t.data.title
             ));
         }
@@ -119,7 +114,7 @@ pub fn format_ticket_show(
             out.push_str(&format!(
                 "- {} [{}] {}\n",
                 t.metadata.id,
-                format_status(&t.metadata.status),
+                t.metadata.status,
                 t.data.title
             ));
         }
@@ -136,7 +131,7 @@ pub fn format_ticket_show(
             out.push_str(&format!(
                 "- {} [{}] {}\n",
                 t.metadata.id,
-                format_status(&t.metadata.status),
+                t.metadata.status,
                 t.data.title
             ));
         }
@@ -157,7 +152,7 @@ pub fn format_ticket_show(
 
 /// Format a ticket list entry (for ls, ready, blocked, closed).
 pub fn format_ticket_list(ticket: &Ticket, show_deps: bool) -> String {
-    let status_str = format_status(&ticket.metadata.status);
+    let status_str = ticket.metadata.status.as_str();
     let priority_str = format_priority(ticket.metadata.priority.to_u8());
 
     let deps_str = if show_deps && !ticket.metadata.deps.is_empty() {
@@ -176,15 +171,15 @@ pub fn format_ticket_list(ticket: &Ticket, show_deps: bool) -> String {
 pub fn format_ticket_blocked(
     ticket: &Ticket,
     blockers: &[String],
-    statuses: &HashMap<String, Status>,
+    statuses: &HashMap<String, String>,
 ) -> String {
-    let status_str = format_status(&ticket.metadata.status);
+    let status_str = ticket.metadata.status.as_str();
     let priority_str = format_priority(ticket.metadata.priority.to_u8());
 
     let blocker_str: String = blockers
         .iter()
         .map(|b| {
-            let s = statuses.get(b).map(|s| format_status(s)).unwrap_or_default();
+            let s = statuses.get(b).map(|s| s.as_str()).unwrap_or_default();
             format!("{}[{}]", b, s)
         })
         .collect::<Vec<_>>()
@@ -213,26 +208,6 @@ fn format_id_list(ids: &[String], titles: &HashMap<String, String>) -> String {
     format!("[{}]", items.join(", "))
 }
 
-/// Format a status for display.
-pub fn format_status(status: &Status) -> &'static str {
-    match status {
-        Status::Open => "open",
-        Status::InProgress => "in_progress",
-        Status::Closed => "closed",
-    }
-}
-
-/// Format a ticket type for display.
-pub fn format_ticket_type(t: &crate::types::TicketType) -> &'static str {
-    match t {
-        crate::types::TicketType::Bug => "bug",
-        crate::types::TicketType::Feature => "feature",
-        crate::types::TicketType::Task => "task",
-        crate::types::TicketType::Epic => "epic",
-        crate::types::TicketType::Chore => "chore",
-    }
-}
-
 /// Format a priority number for display.
 pub fn format_priority(p: u8) -> String {
     format!("P{}", p)
@@ -253,9 +228,10 @@ fn ticket_to_json(ticket: &Ticket) -> String {
     let mut parts = Vec::new();
 
     parts.push(format!(
-        r#""id":"{}","status":"{}""#,
+        r#""id":"{}","status":"{}","open":{}"#,
         json_escape(&ticket.metadata.id),
-        format_status(&ticket.metadata.status)
+        json_escape(&ticket.metadata.status),
+        ticket.metadata.open
     ));
     parts.push(format!(
         r#""deps":{}"#,
@@ -271,7 +247,7 @@ fn ticket_to_json(ticket: &Ticket) -> String {
     ));
     parts.push(format!(
         r#""type":"{}""#,
-        format_ticket_type(&ticket.metadata.metadata_type)
+        json_escape(&ticket.metadata.metadata_type)
     ));
     parts.push(format!(
         r#""priority":{}"#,
@@ -324,13 +300,14 @@ mod tests {
     use super::*;
     use crate::storage::Ticket;
 
-    fn make_ticket(id: &str, title: &str, status: Status) -> Ticket {
+    fn make_ticket(id: &str, title: &str, status: &str, open: bool) -> Ticket {
         Ticket::parse(
             &format!(
                 "\
 ---
 id: {}
 status: {}
+open: {}
 deps: []
 links: []
 created: 2024-01-15T10:00:00Z
@@ -341,11 +318,8 @@ priority: 2
 # {}
 ",
                 id,
-                match status {
-                    Status::Open => "open",
-                    Status::InProgress => "in_progress",
-                    Status::Closed => "closed",
-                },
+                status,
+                open,
                 title
             ),
             id,
@@ -355,7 +329,7 @@ priority: 2
 
     #[test]
     fn test_format_ticket_list() {
-        let ticket = make_ticket("test-0001", "Test ticket", Status::Open);
+        let ticket = make_ticket("test-0001", "Test ticket", "open", true);
         let output = format_ticket_list(&ticket, false);
         assert!(output.contains("test-0001"));
         assert!(output.contains("[open]"));
@@ -364,15 +338,8 @@ priority: 2
     }
 
     #[test]
-    fn test_format_status() {
-        assert_eq!(format_status(&Status::Open), "open");
-        assert_eq!(format_status(&Status::InProgress), "in_progress");
-        assert_eq!(format_status(&Status::Closed), "closed");
-    }
-
-    #[test]
     fn test_format_tickets_jsonl() {
-        let ticket = make_ticket("test-0001", "Test ticket", Status::Open);
+        let ticket = make_ticket("test-0001", "Test ticket", "open", true);
         let jsonl = format_tickets_jsonl(&[ticket]);
         assert!(jsonl.contains("test-0001"));
         assert!(jsonl.contains("open"));

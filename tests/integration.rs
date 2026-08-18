@@ -111,6 +111,7 @@ fn test_create_basic_ticket() {
     assert!(content.contains(&id), "Content should contain the ID");
     assert!(content.contains("# My first ticket"), "Content should contain title");
     assert!(content.contains("status: open"), "Default status should be open");
+    assert!(content.contains("open: true"), "Default open should be true");
     assert!(content.contains("type: task"), "Default type should be task");
     assert!(content.contains("priority: 2"), "Default priority should be 2");
     assert!(content.contains("deps: []"), "Default deps should be empty");
@@ -262,11 +263,13 @@ fn test_reopen_command() {
 }
 
 #[test]
-fn test_invalid_status() {
+fn test_status_free_form() {
     let t = TicketTest::new();
     let id = t.create("Test");
-    let err = t.run_fail(&["status", &id, "invalid"]);
-    assert!(err.contains("invalid status") || err.contains("invalid"));
+    // `status` is a free-form label: any string is accepted, no validation.
+    t.run_ok(&["status", &id, "cancelled"]);
+    let content = t.read_ticket_file(&id);
+    assert!(content.contains("status: cancelled"));
 }
 
 #[test]
@@ -631,7 +634,7 @@ fn test_storage_dir_walking() {
     fs::write(
         tickets_dir.join(format!("{}.md", id)),
         format!(
-            "---\nid: {}\nstatus: open\ndeps: []\nlinks: []\ncreated: 2024-01-15T10:00:00Z\ntype: task\npriority: 2\n---\n\n# Test\n",
+            "---\nid: {}\nstatus: open\nopen: true\ndeps: []\nlinks: []\ncreated: 2024-01-15T10:00:00Z\ntype: task\npriority: 2\n---\n\n# Test\n",
             id
         ),
     ).unwrap();
@@ -910,4 +913,71 @@ fn test_list_with_search_filter() {
     let out = t.run_ok(&["ls", "-s", "Payment"]);
     assert!(out.contains(&id1), "Payment ticket should appear: {}", out);
     assert!(!out.contains(&id2), "Login ticket should not appear: {}", out);
+}
+
+// ---------------------------------------------------------------------------
+// Migrate / open-field tests
+// ---------------------------------------------------------------------------
+
+fn hand_write_ticket(t: &TicketTest, id: &str, status: &str) {
+    let dir = t.path().join(".tickets");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{}.md", id)),
+        format!(
+            "---\nid: {}\nstatus: {}\ndeps: []\nlinks: []\ncreated: 2024-01-15T10:00:00Z\ntype: task\npriority: 2\n---\n\n# {}\n",
+            id, status, id
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_migrate_adds_open_field() {
+    let t = TicketTest::new();
+    hand_write_ticket(&t, "aa-1111", "open");
+    hand_write_ticket(&t, "bb-2222", "closed");
+
+    let out = t.run_ok(&["migrate"]);
+    assert!(out.contains("Migrated 2 ticket(s)"), "migrate should report 2: {}", out);
+
+    let dir = t.path().join(".tickets");
+    let a = fs::read_to_string(dir.join("aa-1111.md")).unwrap();
+    let b = fs::read_to_string(dir.join("bb-2222.md")).unwrap();
+    assert!(a.contains("open: true"), "open ticket should get open: true: {}", a);
+    assert!(b.contains("open: false"), "closed ticket should get open: false: {}", b);
+}
+
+#[test]
+fn test_migrate_is_idempotent() {
+    let t = TicketTest::new();
+    hand_write_ticket(&t, "aa-1111", "open");
+    t.run_ok(&["migrate"]);
+    // Second run should find nothing to do.
+    let out = t.run_ok(&["migrate"]);
+    assert!(out.contains("Migrated 0 ticket(s)"), "second migrate should be a no-op: {}", out);
+}
+
+#[test]
+fn test_missing_open_field_errors() {
+    let t = TicketTest::new();
+    hand_write_ticket(&t, "cc-3333", "open");
+    let err = t.run_fail(&["show", "cc-3333"]);
+    assert!(err.contains("tk migrate"), "should point at migrate: {}", err);
+}
+
+#[test]
+fn test_list_with_open_closed_filter() {
+    let t = TicketTest::new();
+    let id_open = t.create("Active ticket");
+    let id_closed = t.create("Done ticket");
+    t.run_ok(&["close", &id_closed]);
+
+    let out = t.run_ok(&["ls", "--open"]);
+    assert!(out.contains(&id_open), "open ticket should appear: {}", out);
+    assert!(!out.contains(&id_closed), "closed ticket should not appear in --open: {}", out);
+
+    let out = t.run_ok(&["ls", "--closed"]);
+    assert!(out.contains(&id_closed), "closed ticket should appear: {}", out);
+    assert!(!out.contains(&id_open), "open ticket should not appear in --closed: {}", out);
 }

@@ -4,8 +4,19 @@
 //   prefix: first letter of each hyphen/underscore segment of directory name (or first 3 chars)
 //   suffix: 4-char lower-case alphanumeric random string, e.g. "nw-5c46", "tk-ab12"
 //
-// Status lifecycle: open → in_progress → closed (reopen goes back to open)
-// Type: bug, feature, task, epic, chore
+// `open` is the single source of truth for open/closed:
+//   open: true  = active (open or in progress)
+//   open: false = terminal (closed / done / cancelled / ...)
+// It is REQUIRED on every ticket. A ticket missing it is a parse error that
+// points the user at `tk migrate`.
+//
+// `status` is a free-form label (e.g. "open", "in_progress", "done",
+// "cancelled", or anything the user wants). The tool stores it verbatim and
+// does not interpret it — the user assigns meaning in their own analytics.
+//
+// `type` is also a free-form label (conventional values: bug, feature, task,
+// epic, chore — but any string is accepted).
+//
 // Priority: 0-4, 0=highest, default 2
 // Assignee defaults to git user.name at creation
 // External ref: e.g. "gh-123", "jira-456"
@@ -19,18 +30,17 @@
 // Frontmatter between `---` delimiters, YAML key-value pairs.
 // Body after closing --- with # title, ## Design, ## Acceptance Criteria, ## Notes sections.
 
-export type Status = 'open' | 'in_progress' | 'closed'
-export type Type = 'bug' | 'feature' | 'task' | 'epic' | 'chore'
 export type Priority = 0 | 1 | 2 | 3 | 4
 export type Id = string & { readonly __brand: 'ticket-id' }
 
 export interface Metadata {
   id: Id
-  status: Status
+  open: boolean
+  status: string
   deps: Id[]
   links: Id[]
   created: string
-  type: Type
+  type: string
   priority: Priority
   assignee?: string
   externalRef?: string
@@ -64,7 +74,7 @@ export interface CreateOptions {
   description?: string
   design?: string
   acceptance?: string
-  type?: Type
+  type?: string
   priority?: Priority
   assignee?: string
   externalRef?: string
@@ -73,9 +83,10 @@ export interface CreateOptions {
 }
 
 export interface Filter {
-  status?: Status
+  open?: boolean
+  status?: string
   assignee?: string
-  type?: Type
+  type?: string
   tags?: string[]
 }
 
@@ -84,6 +95,7 @@ export const FRONTMATTER_DELIMITER = '---' as const
 export const CANONICAL_FIELD_ORDER: (keyof Metadata)[] = [
   'id',
   'status',
+  'open',
   'deps',
   'links',
   'created',

@@ -8,7 +8,6 @@
 //! - Computing inverse relationships (blocked_by, blocking, children)
 
 use crate::storage::Ticket;
-use crate::types::Status;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Directed graph of ticket dependencies.
@@ -63,10 +62,10 @@ impl DependencyGraph {
     }
 
     /// Check if a ticket has all dependencies closed.
-    pub fn is_ready(&self, id: &str, statuses: &HashMap<String, Status>) -> bool {
+    pub fn is_ready(&self, id: &str, open: &HashMap<String, bool>) -> bool {
         if let Some(deps) = self.deps.get(id) {
             for dep_id in deps {
-                if statuses.get(dep_id).map(|s| *s != Status::Closed).unwrap_or(true) {
+                if open.get(dep_id).copied().unwrap_or(true) {
                     return false;
                 }
             }
@@ -75,17 +74,17 @@ impl DependencyGraph {
     }
 
     /// Check if a ticket has at least one non-closed dependency.
-    pub fn is_blocked(&self, id: &str, statuses: &HashMap<String, Status>) -> bool {
-        !self.is_ready(id, statuses) && self.deps.get(id).map(|d| !d.is_empty()).unwrap_or(false)
+    pub fn is_blocked(&self, id: &str, open: &HashMap<String, bool>) -> bool {
+        !self.is_ready(id, open) && self.deps.get(id).map(|d| !d.is_empty()).unwrap_or(false)
     }
 
     /// Get the list of blocker tickets (non-closed dependencies).
-    pub fn blockers(&self, id: &str, statuses: &HashMap<String, Status>) -> Vec<String> {
+    pub fn blockers(&self, id: &str, open: &HashMap<String, bool>) -> Vec<String> {
         self.deps
             .get(id)
             .map(|deps| {
                 deps.iter()
-                    .filter(|d| statuses.get(d.as_str()).map(|s| *s != Status::Closed).unwrap_or(true))
+                    .filter(|d| open.get(d.as_str()).copied().unwrap_or(true))
                     .cloned()
                     .collect()
             })
@@ -262,7 +261,7 @@ fn normalize_cycle(ids: &[String]) -> String {
 pub fn render_dep_tree(
     graph: &DependencyGraph,
     root: &str,
-    statuses: &HashMap<String, Status>,
+    statuses: &HashMap<String, String>,
     titles: &HashMap<String, String>,
     full: bool,
 ) -> String {
@@ -271,7 +270,7 @@ pub fn render_dep_tree(
     let mut visited: HashSet<String> = HashSet::new();
 
     // Root line
-    let root_status = statuses.get(root).map(|s| format!("{:?}", s)).unwrap_or_default();
+    let root_status = statuses.get(root).map(|s| s.as_str()).unwrap_or_default();
     let root_title = titles.get(root).map(|s| s.as_str()).unwrap_or("");
     output.push_str(&format!("{} [{}] {}\n", root, root_status, root_title));
 
@@ -313,7 +312,7 @@ pub fn render_dep_tree(
         let connector = if entry.last { "└── " } else { "├── " };
         let status = statuses
             .get(&entry.id)
-            .map(|s| format!("{:?}", s))
+            .map(|s| s.as_str())
             .unwrap_or_default();
         let title = titles.get(&entry.id).map(|s| s.as_str()).unwrap_or("");
 
@@ -356,17 +355,18 @@ pub fn render_dep_tree(
 mod tests {
     use super::*;
     use crate::storage::Ticket;
-    use crate::types::{Metadata, Status, TicketType, Priority, Data};
+    use crate::types::{Metadata, Priority, Data};
 
-    fn make_ticket(id: &str, deps: Vec<String>, status: Status, parent: Option<String>) -> Ticket {
+    fn make_ticket(id: &str, deps: Vec<String>, open: bool, parent: Option<String>) -> Ticket {
         Ticket {
             metadata: Metadata {
                 id: id.to_string(),
-                status,
+                status: "open".to_string(),
+                open,
                 deps,
                 links: vec![],
                 created: "2024-01-15T10:00:00Z".to_string(),
-                metadata_type: TicketType::Task,
+                metadata_type: "task".to_string(),
                 priority: Priority::P2,
                 assignee: None,
                 external_ref: None,
@@ -383,8 +383,12 @@ mod tests {
         }
     }
 
-    fn build_statuses(tickets: &[Ticket]) -> HashMap<String, Status> {
-        tickets.iter().map(|t| (t.metadata.id.clone(), t.metadata.status)).collect()
+    fn build_open(tickets: &[Ticket]) -> HashMap<String, bool> {
+        tickets.iter().map(|t| (t.metadata.id.clone(), t.metadata.open)).collect()
+    }
+
+    fn build_status_strings(tickets: &[Ticket]) -> HashMap<String, String> {
+        tickets.iter().map(|t| (t.metadata.id.clone(), t.metadata.status.clone())).collect()
     }
 
     fn build_titles(tickets: &[Ticket]) -> HashMap<String, String> {
@@ -394,9 +398,9 @@ mod tests {
     #[test]
     fn test_graph_build() {
         let tickets = vec![
-            make_ticket("A", vec!["B".into()], Status::Open, None),
-            make_ticket("B", vec![], Status::Open, None),
-            make_ticket("C", vec!["A".into()], Status::Closed, None),
+            make_ticket("A", vec!["B".into()], true, None),
+            make_ticket("B", vec![], true, None),
+            make_ticket("C", vec!["A".into()], false, None),
         ];
 
         let graph = DependencyGraph::build(&tickets);
@@ -413,58 +417,58 @@ mod tests {
     #[test]
     fn test_is_ready() {
         let tickets = vec![
-            make_ticket("A", vec!["B".into()], Status::Open, None),
-            make_ticket("B", vec![], Status::Closed, None),
-            make_ticket("C", vec!["D".into()], Status::Open, None),
-            make_ticket("D", vec![], Status::Open, None),
+            make_ticket("A", vec!["B".into()], true, None),
+            make_ticket("B", vec![], false, None),
+            make_ticket("C", vec!["D".into()], true, None),
+            make_ticket("D", vec![], true, None),
         ];
 
-        let statuses = build_statuses(&tickets);
+        let open = build_open(&tickets);
         let graph = DependencyGraph::build(&tickets);
 
-        assert!(graph.is_ready("A", &statuses)); // dep B is closed
-        assert!(!graph.is_ready("C", &statuses)); // dep D is open
-        assert!(graph.is_ready("B", &statuses)); // no deps
+        assert!(graph.is_ready("A", &open)); // dep B is closed
+        assert!(!graph.is_ready("C", &open)); // dep D is open
+        assert!(graph.is_ready("B", &open)); // no deps
     }
 
     #[test]
     fn test_is_blocked() {
         let tickets = vec![
-            make_ticket("A", vec!["B".into()], Status::Open, None),
-            make_ticket("B", vec![], Status::Closed, None),
-            make_ticket("C", vec!["D".into()], Status::Open, None),
-            make_ticket("D", vec![], Status::Open, None),
-            make_ticket("E", vec![], Status::Open, None),
+            make_ticket("A", vec!["B".into()], true, None),
+            make_ticket("B", vec![], false, None),
+            make_ticket("C", vec!["D".into()], true, None),
+            make_ticket("D", vec![], true, None),
+            make_ticket("E", vec![], true, None),
         ];
 
-        let statuses = build_statuses(&tickets);
+        let open = build_open(&tickets);
         let graph = DependencyGraph::build(&tickets);
 
-        assert!(!graph.is_blocked("A", &statuses)); // dep B is closed
-        assert!(graph.is_blocked("C", &statuses));  // dep D is open
-        assert!(!graph.is_blocked("E", &statuses)); // no deps
+        assert!(!graph.is_blocked("A", &open)); // dep B is closed
+        assert!(graph.is_blocked("C", &open));  // dep D is open
+        assert!(!graph.is_blocked("E", &open)); // no deps
     }
 
     #[test]
     fn test_blockers() {
         let tickets = vec![
-            make_ticket("A", vec!["B".into(), "C".into()], Status::Open, None),
-            make_ticket("B", vec![], Status::Closed, None),
-            make_ticket("C", vec![], Status::Open, None),
+            make_ticket("A", vec!["B".into(), "C".into()], true, None),
+            make_ticket("B", vec![], false, None),
+            make_ticket("C", vec![], true, None),
         ];
 
-        let statuses = build_statuses(&tickets);
+        let open = build_open(&tickets);
         let graph = DependencyGraph::build(&tickets);
 
-        let blockers = graph.blockers("A", &statuses);
+        let blockers = graph.blockers("A", &open);
         assert_eq!(blockers, vec!["C"]);
     }
 
     #[test]
     fn test_cycle_detection_simple() {
         let tickets = vec![
-            make_ticket("A", vec!["B".into()], Status::Open, None),
-            make_ticket("B", vec!["A".into()], Status::Open, None),
+            make_ticket("A", vec!["B".into()], true, None),
+            make_ticket("B", vec!["A".into()], true, None),
         ];
 
         let graph = DependencyGraph::build(&tickets);
@@ -477,9 +481,9 @@ mod tests {
     #[test]
     fn test_no_cycles() {
         let tickets = vec![
-            make_ticket("A", vec!["B".into()], Status::Open, None),
-            make_ticket("B", vec!["C".into()], Status::Open, None),
-            make_ticket("C", vec![], Status::Open, None),
+            make_ticket("A", vec!["B".into()], true, None),
+            make_ticket("B", vec!["C".into()], true, None),
+            make_ticket("C", vec![], true, None),
         ];
 
         let graph = DependencyGraph::build(&tickets);
@@ -489,9 +493,9 @@ mod tests {
     #[test]
     fn test_cycle_detection_longer() {
         let tickets = vec![
-            make_ticket("A", vec!["B".into()], Status::Open, None),
-            make_ticket("B", vec!["C".into()], Status::Open, None),
-            make_ticket("C", vec!["A".into()], Status::Open, None),
+            make_ticket("A", vec!["B".into()], true, None),
+            make_ticket("B", vec!["C".into()], true, None),
+            make_ticket("C", vec!["A".into()], true, None),
         ];
 
         let graph = DependencyGraph::build(&tickets);
@@ -503,10 +507,10 @@ mod tests {
     #[test]
     fn test_subtree_depths() {
         let tickets = vec![
-            make_ticket("A", vec!["B".into(), "C".into()], Status::Open, None),
-            make_ticket("B", vec!["D".into()], Status::Open, None),
-            make_ticket("C", vec![], Status::Open, None),
-            make_ticket("D", vec![], Status::Open, None),
+            make_ticket("A", vec!["B".into(), "C".into()], true, None),
+            make_ticket("B", vec!["D".into()], true, None),
+            make_ticket("C", vec![], true, None),
+            make_ticket("D", vec![], true, None),
         ];
 
         let graph = DependencyGraph::build(&tickets);
@@ -525,17 +529,17 @@ mod tests {
     #[test]
     fn test_render_dep_tree() {
         let tickets = vec![
-            make_ticket("A", vec!["B".into(), "C".into()], Status::Open, None),
-            make_ticket("B", vec!["D".into()], Status::Open, None),
-            make_ticket("C", vec![], Status::Closed, None),
-            make_ticket("D", vec![], Status::Open, None),
+            make_ticket("A", vec!["B".into(), "C".into()], true, None),
+            make_ticket("B", vec!["D".into()], true, None),
+            make_ticket("C", vec![], false, None),
+            make_ticket("D", vec![], true, None),
         ];
 
         let graph = DependencyGraph::build(&tickets);
-        let statuses = build_statuses(&tickets);
+        let status_strings = build_status_strings(&tickets);
         let titles = build_titles(&tickets);
 
-        let tree = render_dep_tree(&graph, "A", &statuses, &titles, false);
+        let tree = render_dep_tree(&graph, "A", &status_strings, &titles, false);
         assert!(tree.contains("A"));
         assert!(tree.contains("B"));
         assert!(tree.contains("C"));

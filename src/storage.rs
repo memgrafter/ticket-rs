@@ -8,7 +8,7 @@
 //! - Partial ID resolution via an in-memory index
 
 use crate::id::{ticket_filename, ticket_id_from_filename};
-use crate::types::{CreateOptions, Data, Metadata, Note, Priority, Status, TicketType};
+use crate::types::{CreateOptions, Data, Metadata, Note, Priority};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use std::cell::RefCell;
@@ -136,11 +136,12 @@ impl Storage {
 
         let metadata = Metadata {
             id: id.clone(),
-            status: Status::Open,
+            status: "open".to_string(),
+            open: true,
             deps: vec![],
             links: vec![],
             created: now.clone(),
-            metadata_type: opts.create_type.unwrap_or(TicketType::Task),
+            metadata_type: opts.create_type.clone().unwrap_or_else(|| "task".to_string()),
             priority: opts.priority.unwrap_or(Priority::P2),
             assignee: opts.assignee.clone().or_else(|| {
                 // Default to git user.name
@@ -287,14 +288,52 @@ impl Storage {
 
         Ok(())
     }
+
+    /// Add an `open:` field to every ticket file that lacks one.
+    ///
+    /// The value is `false` when the ticket's `status` is `closed`, otherwise
+    /// `true`. Files that already have an `open:` field are left untouched.
+    /// Returns the `(id, open_value)` pairs for tickets that were modified,
+    /// plus the count of tickets that already had the field (skipped).
+    pub fn migrate(&self) -> Result<(Vec<(String, bool)>, usize)> {
+        let entries = fs::read_dir(&self.dir)
+            .with_context(|| format!("Failed to read directory {:?}", self.dir))?;
+        let mut modified: Vec<(String, bool)> = Vec::new();
+        let mut skipped = 0usize;
+
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") {
+                continue;
+            }
+            let path = entry.path();
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read ticket file {:?}", path))?;
+
+            match insert_open_field(&content) {
+                Some((new_content, open_value)) => {
+                    fs::write(&path, new_content.as_bytes())
+                        .with_context(|| format!("Failed to write ticket file {:?}", path))?;
+                    let id = ticket_id_from_filename(&name).unwrap_or_else(|| name.clone());
+                    modified.push((id, open_value));
+                }
+                None => skipped += 1,
+            }
+        }
+
+        modified.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((modified, skipped))
+    }
 }
 
 /// Search/filter query for tickets.
 #[derive(Debug, Default)]
 pub struct SearchQuery {
-    pub status: Option<Status>,
+    pub open: Option<bool>,
+    pub status: Option<String>,
     pub assignee: Option<String>,
-    pub ticket_type: Option<TicketType>,
+    pub ticket_type: Option<String>,
     pub tags: Option<Vec<String>>,
     pub search: Option<String>,
     #[allow(dead_code)]
@@ -303,6 +342,11 @@ pub struct SearchQuery {
 
 impl SearchQuery {
     fn matches(&self, ticket: &Ticket) -> bool {
+        if let Some(open) = self.open {
+            if ticket.metadata.open != open {
+                return false;
+            }
+        }
         if let Some(ref status) = self.status {
             if ticket.metadata.status != *status {
                 return false;
@@ -384,11 +428,12 @@ impl std::fmt::Display for Ticket {
 
         // Serialize metadata fields in canonical order
         out.push_str(&format!("id: {}\n", self.metadata.id));
-        out.push_str(&format!("status: {}\n", serde_yaml::to_string(&self.metadata.status).unwrap().trim()));
+        out.push_str(&format!("status: {}\n", self.metadata.status));
+        out.push_str(&format!("open: {}\n", self.metadata.open));
         out.push_str(&format!("deps: {}\n", format_yaml_array(&self.metadata.deps)));
         out.push_str(&format!("links: {}\n", format_yaml_array(&self.metadata.links)));
         out.push_str(&format!("created: {}\n", self.metadata.created));
-        out.push_str(&format!("type: {}\n", serde_yaml::to_string(&self.metadata.metadata_type).unwrap().trim()));
+        out.push_str(&format!("type: {}\n", self.metadata.metadata_type));
         out.push_str(&format!("priority: {}\n", self.metadata.priority.to_u8()));
         if let Some(ref a) = self.metadata.assignee {
             out.push_str(&format!("assignee: {}\n", a));
@@ -439,11 +484,12 @@ impl std::fmt::Display for Ticket {
 /// Parse YAML frontmatter string into Metadata.
 fn parse_frontmatter(yaml_str: &str, default_id: &str) -> Result<Metadata> {
     let mut id = default_id.to_string();
-    let mut status = Status::Open;
+    let mut status = String::new();
+    let mut open: Option<bool> = None;
     let mut deps: Vec<String> = vec![];
     let mut links: Vec<String> = vec![];
     let mut created = String::new();
-    let mut metadata_type = TicketType::Task;
+    let mut metadata_type = String::new();
     let mut priority = Priority::P2;
     let mut assignee: Option<String> = None;
     let mut external_ref: Option<String> = None;
@@ -461,14 +507,8 @@ fn parse_frontmatter(yaml_str: &str, default_id: &str) -> Result<Metadata> {
 
             match key {
                 "id" => id = value.to_string(),
-                "status" => {
-                    status = match value {
-                        "open" => Status::Open,
-                        "in_progress" => Status::InProgress,
-                        "closed" => Status::Closed,
-                        _ => Status::Open,
-                    };
-                }
+                "status" => status = value.to_string(),
+                "open" => open = Some(value == "true"),
                 "deps" => {
                     deps = parse_yaml_array(value);
                 }
@@ -476,16 +516,7 @@ fn parse_frontmatter(yaml_str: &str, default_id: &str) -> Result<Metadata> {
                     links = parse_yaml_array(value);
                 }
                 "created" => created = value.to_string(),
-                "type" => {
-                    metadata_type = match value {
-                        "bug" => TicketType::Bug,
-                        "feature" => TicketType::Feature,
-                        "task" => TicketType::Task,
-                        "epic" => TicketType::Epic,
-                        "chore" => TicketType::Chore,
-                        _ => TicketType::Task,
-                    };
-                }
+                "type" => metadata_type = value.to_string(),
                 "priority" => {
                     priority = value.parse::<u8>().ok().and_then(Priority::from_u8).unwrap_or(Priority::P2);
                 }
@@ -504,9 +535,18 @@ fn parse_frontmatter(yaml_str: &str, default_id: &str) -> Result<Metadata> {
         created = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     }
 
+    let open = match open {
+        Some(open) => open,
+        None => bail!(
+            "ticket '{}' is missing the required 'open' field. Run `tk migrate` to add it, then retry.",
+            id
+        ),
+    };
+
     Ok(Metadata {
         id,
         status,
+        open,
         deps,
         links,
         created,
@@ -643,6 +683,70 @@ fn format_yaml_array(items: &[String]) -> String {
     }
 }
 
+/// If `content`'s frontmatter has no `open:` line, insert one (value `false`
+/// when `status` is `closed`, else `true`) and return the new content plus the
+/// value. Returns `None` when the file already has an `open:` line or has no
+/// frontmatter block.
+fn insert_open_field(content: &str) -> Option<(String, bool)> {
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+
+    // Locate the frontmatter block (between the first two `---` lines).
+    let mut start: Option<usize> = None;
+    let mut end: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() == "---" {
+            match start {
+                None => start = Some(i),
+                Some(_) => {
+                    end = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+    let (start, end) = match (start, end) {
+        (Some(s), Some(e)) => (s, e),
+        _ => return None,
+    };
+
+    let frontmatter = &lines[start + 1..end];
+
+    // Already has an `open:` line? Leave it alone.
+    if frontmatter.iter().any(|l| l.trim().starts_with("open:")) {
+        return None;
+    }
+
+    // Derive the value from the existing `status:` line.
+    let status_value = frontmatter
+        .iter()
+        .find(|l| l.trim().starts_with("status:"))
+        .and_then(|l| l.trim().strip_prefix("status:"))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default();
+    let open_value = status_value != "closed";
+
+    // Insert right after the `status:` line (or after `id:` if there is no
+    // status line), matching the canonical field order (id, status, open, …).
+    let insert_at = frontmatter
+        .iter()
+        .position(|l| l.trim().starts_with("status:"))
+        .map(|pos| start + 1 + pos + 1)
+        .or_else(|| {
+            frontmatter
+                .iter()
+                .position(|l| l.trim().starts_with("id:"))
+                .map(|pos| start + 1 + pos + 1)
+        })
+        .unwrap_or(start + 1);
+
+    lines.insert(insert_at, format!("open: {}", open_value));
+    let mut new_content = lines.join("\n");
+    if content.ends_with('\n') {
+        new_content.push('\n');
+    }
+    Some((new_content, open_value))
+}
+
 /// Walk parent directories to find .tickets/.
 fn find_tickets_dir(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start.to_path_buf());
@@ -680,6 +784,7 @@ mod tests {
 ---
 id: nw-5c46
 status: open
+open: true
 deps: []
 links: []
 created: 2024-01-15T10:00:00Z
@@ -710,8 +815,8 @@ First note.
 
         let ticket = Ticket::parse(content, "nw-5c46").unwrap();
         assert_eq!(ticket.metadata.id, "nw-5c46");
-        assert_eq!(ticket.metadata.status, Status::Open);
-        assert_eq!(ticket.metadata.metadata_type, TicketType::Task);
+        assert_eq!(ticket.metadata.status, "open");
+        assert_eq!(ticket.metadata.metadata_type, "task");
         assert_eq!(ticket.metadata.priority, Priority::P2);
         assert_eq!(ticket.metadata.assignee.as_deref(), Some("Alice"));
         assert_eq!(ticket.metadata.tags.as_deref(), Some(&["ui".to_string(), "urgent".to_string()][..]));
@@ -738,6 +843,7 @@ First note.
 ---
 id: test-0001
 status: open
+open: true
 deps: []
 links: []
 created: 2024-01-15T10:00:00Z
@@ -760,6 +866,7 @@ priority: 2
 ---
 id: task-0001
 status: open
+open: true
 deps: [task-0002]
 links: []
 created: 2024-01-15T10:00:00Z
@@ -799,6 +906,7 @@ Second note body.
 ---
 id: test-0001
 status: open
+open: true
 deps: []
 links: []
 created: 2024-01-15T10:00:00Z
@@ -815,13 +923,13 @@ tags: [ui, backend]
         .unwrap();
 
         let q = SearchQuery {
-            status: Some(Status::Open),
+            status: Some("open".to_string()),
             ..Default::default()
         };
         assert!(q.matches(&ticket));
 
         let q = SearchQuery {
-            status: Some(Status::Closed),
+            status: Some("closed".to_string()),
             ..Default::default()
         };
         assert!(!q.matches(&ticket));
@@ -839,7 +947,7 @@ tags: [ui, backend]
         assert!(!q.matches(&ticket));
 
         let q = SearchQuery {
-            ticket_type: Some(TicketType::Bug),
+            ticket_type: Some("bug".to_string()),
             ..Default::default()
         };
         assert!(q.matches(&ticket));

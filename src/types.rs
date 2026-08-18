@@ -4,7 +4,6 @@
 //! All types correspond to interfaces exported from ticket.ts.
 
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 
 /// Priority: 0-4, 0=highest, default 2
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -34,53 +33,22 @@ impl Priority {
     }
 }
 
-/// Status lifecycle: open → in_progress → closed (reopen goes back to open)
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Status {
-    Open,
-    #[serde(rename = "in_progress")]
-    InProgress,
-    Closed,
-}
-
-/// Type: bug, feature, task, epic, chore
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum TicketType {
-    Bug,
-    Feature,
-    Task,
-    Epic,
-    Chore,
-}
-
-impl FromStr for TicketType {
-    type Err = String;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "bug" => Ok(TicketType::Bug),
-            "feature" => Ok(TicketType::Feature),
-            "task" => Ok(TicketType::Task),
-            "epic" => Ok(TicketType::Epic),
-            "chore" => Ok(TicketType::Chore),
-            _ => Err(format!("unknown type: {}", s)),
-        }
-    }
-}
-
 /// Frontmatter metadata for a ticket file.
 /// Corresponds to ticket.ts `Metadata` / `Frontmatter`.
+///
+/// `open` is the required open/closed gate. `status` and `type` are free-form
+/// labels stored verbatim — the tool does not interpret them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Metadata {
     pub id: String,
-    pub status: Status,
+    pub status: String,
+    pub open: bool,
     pub deps: Vec<String>,
     pub links: Vec<String>,
     pub created: String,
     #[serde(rename = "type")]
-    pub metadata_type: TicketType,
+    pub metadata_type: String,
     pub priority: Priority,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
@@ -122,7 +90,7 @@ pub struct CreateOptions {
     pub design: Option<String>,
     pub acceptance: Option<String>,
     #[serde(rename = "type")]
-    pub create_type: Option<TicketType>,
+    pub create_type: Option<String>,
     pub priority: Option<Priority>,
     pub assignee: Option<String>,
     pub external_ref: Option<String>,
@@ -133,9 +101,10 @@ pub struct CreateOptions {
 /// Filter for listing/searching tickets.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Filter {
-    pub status: Option<Status>,
+    pub open: Option<bool>,
+    pub status: Option<String>,
     pub assignee: Option<String>,
     #[serde(rename = "type")]
-    pub filter_type: Option<TicketType>,
+    pub filter_type: Option<String>,
     pub tags: Option<Vec<String>>,
 }

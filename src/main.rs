@@ -15,7 +15,7 @@ use display::{format_ticket_blocked, format_ticket_list, format_ticket_show, for
 use graph::{render_dep_tree, DependencyGraph};
 use storage::{SearchQuery, Storage, Ticket};
 use std::collections::HashMap;
-use types::{Priority, Status, TicketType};
+use types::Priority;
 
 /// Minimal ticket system with dependency tracking.
 #[derive(Parser)]
@@ -40,9 +40,9 @@ enum Command {
         /// Acceptance criteria
         #[arg(long)]
         acceptance: Option<String>,
-        /// Type (bug|feature|task|epic|chore)
+        /// Type (free-form, e.g. bug, feature, task, epic, chore)
         #[arg(short = 't', long)]
-        issue_type: Option<TicketType>,
+        issue_type: Option<String>,
         /// Priority 0-4, 0=highest
         #[arg(short = 'p', long)]
         priority: Option<u8>,
@@ -59,19 +59,21 @@ enum Command {
         #[arg(long)]
         tags: Option<String>,
     },
-    /// Set status to in_progress
+    /// Mark the ticket open and in progress
     Start {
         id: String,
     },
-    /// Set status to closed
+    /// Mark the ticket closed (terminal)
     Close {
         id: String,
     },
-    /// Set status to open
+    /// Reopen a closed ticket
     Reopen {
         id: String,
     },
-    /// Update status (open|in_progress|closed)
+    /// Add an `open:` field to every ticket that lacks one (no arguments)
+    Migrate,
+    /// Set the free-form status label (any string)
     Status {
         id: String,
         status: String,
@@ -98,15 +100,21 @@ enum Command {
     /// List tickets with optional filters
     #[command(alias = "list")]
     Ls {
-        /// Filter by status
+        /// Filter by the free-form status string
         #[arg(long)]
         status: Option<String>,
+        /// Only show open (active) tickets
+        #[arg(long)]
+        open: bool,
+        /// Only show closed (terminal) tickets
+        #[arg(long)]
+        closed: bool,
         /// Filter by assignee
         #[arg(short = 'a')]
         assignee: Option<String>,
-        /// Filter by type
+        /// Filter by the free-form type string
         #[arg(short = 'T')]
-        ticket_type: Option<TicketType>,
+        ticket_type: Option<String>,
         /// Filter by tags (comma-separated)
         #[arg(long)]
         tags: Option<String>,
@@ -205,11 +213,13 @@ fn main() -> Result<()> {
         Command::Unlink { id, target_id } => cmd_unlink(&id, &target_id),
         Command::Ls {
             status,
+            open,
+            closed,
             assignee,
             ticket_type,
             tags,
             search,
-        } => cmd_list(status, assignee, ticket_type, tags, search),
+        } => cmd_list(status, open, closed, assignee, ticket_type, tags, search),
         Command::Ready { assignee, tag } => cmd_ready(assignee, tag),
         Command::Blocked { assignee, tag } => cmd_blocked(assignee, tag),
         Command::Closed {
@@ -222,6 +232,7 @@ fn main() -> Result<()> {
         Command::AddNote { id, text } => cmd_add_note(&id, text),
         Command::Query { filter } => cmd_query(filter),
         Command::DepTree { id, full } => cmd_dep_tree(&id, full),
+        Command::Migrate => cmd_migrate(),
         Command::DepCycle => cmd_dep_cycle(),
     }
 }
@@ -236,7 +247,7 @@ fn cmd_create(
     description: Option<String>,
     design: Option<String>,
     acceptance: Option<String>,
-    issue_type: Option<TicketType>,
+    issue_type: Option<String>,
     priority: Option<u8>,
     assignee: Option<String>,
     external_ref: Option<String>,
@@ -276,45 +287,55 @@ fn cmd_create(
     Ok(())
 }
 
-fn validate_status(s: &str) -> Result<Status> {
-    match s {
-        "open" => Ok(Status::Open),
-        "in_progress" | "in-progress" => Ok(Status::InProgress),
-        "closed" => Ok(Status::Closed),
-        _ => bail!(
-            "invalid status '{}'. Must be one of: open, in_progress, closed",
-            s
-        ),
-    }
-}
-
 fn cmd_status(id: &str, new_status: &str) -> Result<()> {
-    let status = validate_status(new_status)?;
     let storage = make_storage(false)?;
     let resolved = storage.resolve_id(id)?;
-    storage.update_field(&resolved, "status", &format_status_yaml(&status))?;
-    println!("Updated {} -> {}", resolved, new_status);
+    let _ = storage.read(&resolved)?;
+    storage.update_field(&resolved, "status", new_status)?;
+    println!("Updated {} status -> {}", resolved, new_status);
     Ok(())
 }
 
 fn cmd_start(id: &str) -> Result<()> {
-    cmd_status(id, "in_progress")
+    set_lifecycle(id, true, "in_progress")
 }
 
 fn cmd_close(id: &str) -> Result<()> {
-    cmd_status(id, "closed")
+    set_lifecycle(id, false, "closed")
 }
 
 fn cmd_reopen(id: &str) -> Result<()> {
-    cmd_status(id, "open")
+    set_lifecycle(id, true, "open")
 }
 
-fn format_status_yaml(status: &Status) -> String {
-    match status {
-        Status::Open => "open".to_string(),
-        Status::InProgress => "in_progress".to_string(),
-        Status::Closed => "closed".to_string(),
+fn set_lifecycle(id: &str, open: bool, status: &str) -> Result<()> {
+    let storage = make_storage(false)?;
+    let resolved = storage.resolve_id(id)?;
+    let _ = storage.read(&resolved)?;
+    storage.update_field(&resolved, "open", if open { "true" } else { "false" })?;
+    storage.update_field(&resolved, "status", status)?;
+    println!("Updated {} -> open: {}, status: {}", resolved, open, status);
+    Ok(())
+}
+
+fn cmd_migrate() -> Result<()> {
+    let storage = match make_storage(false) {
+        Ok(s) => s,
+        Err(_) => {
+            println!("No .tickets directory found — nothing to migrate.");
+            return Ok(());
+        }
+    };
+    let (modified, skipped) = storage.migrate()?;
+    for (id, open_value) in &modified {
+        println!("  {}: open: {}", id, open_value);
     }
+    println!(
+        "Migrated {} ticket(s); {} already had an `open` field.",
+        modified.len(),
+        skipped
+    );
+    Ok(())
 }
 
 fn cmd_dep_add(id: &str, dep_id: &str) -> Result<()> {
@@ -436,20 +457,25 @@ fn cmd_unlink(id: &str, target_id: &str) -> Result<()> {
 
 fn cmd_list(
     status: Option<String>,
+    open: bool,
+    closed: bool,
     assignee: Option<String>,
-    ticket_type: Option<TicketType>,
+    ticket_type: Option<String>,
     tags: Option<String>,
     search: Option<String>,
 ) -> Result<()> {
     let storage = make_storage(false)?;
 
-    let parsed_status = status.as_ref().and_then(|s| validate_status(s).ok());
+    if open && closed {
+        bail!("cannot filter by both --open and --closed");
+    }
     let parsed_tags = tags
         .as_ref()
         .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
 
     let query = SearchQuery {
-        status: parsed_status,
+        open: if open { Some(true) } else if closed { Some(false) } else { None },
+        status,
         assignee,
         ticket_type,
         tags: parsed_tags,
@@ -467,17 +493,17 @@ fn cmd_list(
 fn cmd_ready(assignee: Option<String>, tag: Option<String>) -> Result<()> {
     let storage = make_storage(false)?;
     let tickets = storage.all()?;
-    let statuses: HashMap<String, Status> = tickets
+    let open_map: HashMap<String, bool> = tickets
         .iter()
-        .map(|t| (t.metadata.id.clone(), t.metadata.status))
+        .map(|t| (t.metadata.id.clone(), t.metadata.open))
         .collect();
     let graph = DependencyGraph::build(&tickets);
 
     let mut ready: Vec<&Ticket> = tickets
         .iter()
         .filter(|t| {
-            (t.metadata.status == Status::Open || t.metadata.status == Status::InProgress)
-                && graph.is_ready(&t.metadata.id, &statuses)
+            t.metadata.open
+                && graph.is_ready(&t.metadata.id, &open_map)
                 && assignee
                     .as_ref()
                     .map(|a| t.metadata.assignee.as_deref() == Some(a.as_str()))
@@ -511,17 +537,21 @@ fn cmd_ready(assignee: Option<String>, tag: Option<String>) -> Result<()> {
 fn cmd_blocked(assignee: Option<String>, tag: Option<String>) -> Result<()> {
     let storage = make_storage(false)?;
     let tickets = storage.all()?;
-    let statuses: HashMap<String, Status> = tickets
+    let open_map: HashMap<String, bool> = tickets
         .iter()
-        .map(|t| (t.metadata.id.clone(), t.metadata.status))
+        .map(|t| (t.metadata.id.clone(), t.metadata.open))
+        .collect();
+    let statuses: HashMap<String, String> = tickets
+        .iter()
+        .map(|t| (t.metadata.id.clone(), t.metadata.status.clone()))
         .collect();
     let graph = DependencyGraph::build(&tickets);
 
     let mut blocked: Vec<&Ticket> = tickets
         .iter()
         .filter(|t| {
-            (t.metadata.status == Status::Open || t.metadata.status == Status::InProgress)
-                && graph.is_blocked(&t.metadata.id, &statuses)
+            t.metadata.open
+                && graph.is_blocked(&t.metadata.id, &open_map)
                 && assignee
                     .as_ref()
                     .map(|a| t.metadata.assignee.as_deref() == Some(a.as_str()))
@@ -547,7 +577,7 @@ fn cmd_blocked(assignee: Option<String>, tag: Option<String>) -> Result<()> {
     });
 
     for ticket in &blocked {
-        let blockers = graph.blockers(&ticket.metadata.id, &statuses);
+        let blockers = graph.blockers(&ticket.metadata.id, &open_map);
         println!("{}", format_ticket_blocked(ticket, &blockers, &statuses));
     }
     Ok(())
@@ -560,7 +590,7 @@ fn cmd_closed(limit: usize, assignee: Option<String>, tag: Option<String>) -> Re
     let mut closed: Vec<&Ticket> = tickets
         .iter()
         .filter(|t| {
-            t.metadata.status == Status::Closed
+            !t.metadata.open
                 && assignee
                     .as_ref()
                     .map(|a| t.metadata.assignee.as_deref() == Some(a.as_str()))
@@ -593,9 +623,13 @@ fn cmd_show(id: &str) -> Result<()> {
     let ticket = storage.read(&resolved)?;
     let all_tickets = storage.all()?;
 
-    let statuses: HashMap<String, Status> = all_tickets
+    let open_map: HashMap<String, bool> = all_tickets
         .iter()
-        .map(|t| (t.metadata.id.clone(), t.metadata.status))
+        .map(|t| (t.metadata.id.clone(), t.metadata.open))
+        .collect();
+    let statuses: HashMap<String, String> = all_tickets
+        .iter()
+        .map(|t| (t.metadata.id.clone(), t.metadata.status.clone()))
         .collect();
     let titles: HashMap<String, String> = all_tickets
         .iter()
@@ -603,7 +637,7 @@ fn cmd_show(id: &str) -> Result<()> {
         .collect();
     let graph = DependencyGraph::build(&all_tickets);
 
-    let output = format_ticket_show(&ticket, &statuses, &titles, &graph, &all_tickets);
+    let output = format_ticket_show(&ticket, &open_map, &statuses, &titles, &graph, &all_tickets);
     println!("{}", output.trim_end());
     Ok(())
 }
@@ -620,6 +654,7 @@ fn cmd_edit(id: &str) -> Result<()> {
 fn cmd_add_note(id: &str, text: Option<String>) -> Result<()> {
     let storage = make_storage(false)?;
     let resolved = storage.resolve_id(id)?;
+    let _ = storage.read(&resolved)?;
 
     let body = match text {
         Some(t) => t,
@@ -691,8 +726,9 @@ fn matches_jq_filter(ticket: &Ticket, filter: &str) -> bool {
     let value = parts[1].trim().trim_matches('"').trim();
 
     let ticket_value = match field {
-        "status" => Some(display::format_status(&ticket.metadata.status).to_string()),
-        "type" => Some(display::format_ticket_type(&ticket.metadata.metadata_type).to_string()),
+        "status" => Some(ticket.metadata.status.clone()),
+        "open" => Some(ticket.metadata.open.to_string()),
+        "type" => Some(ticket.metadata.metadata_type.clone()),
         "priority" => Some(ticket.metadata.priority.to_u8().to_string()),
         "assignee" => ticket.metadata.assignee.clone(),
         _ => None,
@@ -710,9 +746,9 @@ fn cmd_dep_tree(id: &str, full: bool) -> Result<()> {
     let resolved = storage.resolve_id(id)?;
     let tickets = storage.all()?;
 
-    let statuses: HashMap<String, Status> = tickets
+    let statuses: HashMap<String, String> = tickets
         .iter()
-        .map(|t| (t.metadata.id.clone(), t.metadata.status))
+        .map(|t| (t.metadata.id.clone(), t.metadata.status.clone()))
         .collect();
     let titles: HashMap<String, String> = tickets
         .iter()
@@ -732,7 +768,7 @@ fn cmd_dep_cycle() -> Result<()> {
     // Filter to open tickets only for cycle detection
     let open_tickets: Vec<Ticket> = tickets
         .into_iter()
-        .filter(|t| t.metadata.status != Status::Closed)
+        .filter(|t| t.metadata.open)
         .collect();
 
     let graph = DependencyGraph::build(&open_tickets);
@@ -750,9 +786,9 @@ fn cmd_dep_cycle() -> Result<()> {
         println!("Cycle {}: {}", i + 1, cycle.display);
 
         // Get titles for cycle members
-        let statuses: HashMap<String, Status> = open_tickets
+        let statuses: HashMap<String, String> = open_tickets
             .iter()
-            .map(|t| (t.metadata.id.clone(), t.metadata.status))
+            .map(|t| (t.metadata.id.clone(), t.metadata.status.clone()))
             .collect();
         let titles: HashMap<String, String> = open_tickets
             .iter()
@@ -760,10 +796,7 @@ fn cmd_dep_cycle() -> Result<()> {
             .collect();
 
         for member in &cycle.ids {
-            let s = statuses
-                .get(member)
-                .map(|s| display::format_status(s))
-                .unwrap_or("unknown");
+            let s = statuses.get(member).map(|s| s.as_str()).unwrap_or("unknown");
             let t = titles.get(member).map(|t| t.as_str()).unwrap_or("(unknown)");
             println!("  {:<8} [{}] {}", member, s, t);
         }
@@ -784,20 +817,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_status() {
-        assert!(validate_status("open").is_ok());
-        assert!(validate_status("in_progress").is_ok());
-        assert!(validate_status("closed").is_ok());
-        assert!(validate_status("invalid").is_err());
-    }
-
-    #[test]
     fn test_matches_jq_filter() {
         let ticket = Ticket::parse(
             "\
 ---
 id: test-0001
 status: open
+open: true
 deps: []
 links: []
 created: 2024-01-15T10:00:00Z
