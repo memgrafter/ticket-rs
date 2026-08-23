@@ -79,4 +79,34 @@ tk query '.status == "open" and .deps != []'
 
 - **To put a ticket in another project, you must `cd` to that directory first** — `tk` walks up from the current working directory to find the nearest `.tickets/`, so it always writes to whichever repo's `.tickets/` it finds in its ancestor chain.
 
+## Common pitfalls
+
+### Tickets with bash escape issues
+
+Long descriptions with `$`, `(`, `)`, `<`, `>`, backticks, or quotes get mangled by bash before reaching `tk`. Get the text into a file without bash interpreting it, then pass it with `-d "$(cat file)"`.
+
+#### Method 1: REPL (preferred)
+
+Use when the `repl` tool is installed. Write the file from the REPL so the text never passes through a bash string, then create the ticket:
+
+```python
+open("/tmp/desc.md", "w").write("CREATE TABLE papers (arxiv_id TEXT PRIMARY KEY)")
+```
+
+```sh
+tk create "Add table" -d "$(cat /tmp/desc.md)"
+```
+
+#### Method 2: file (fallback)
+
+```sh
+printf '%s' 'CREATE TABLE papers (arxiv_id TEXT PRIMARY KEY)' > /tmp/desc.md
+tk create "Add table" -d "$(cat /tmp/desc.md)"
+```
+
+If the description contains `$`, `(`, `)`, `<`, `>`, or backticks, use one of the above instead of an inline `-d`.
+
+### No validation
+`tk create` does not validate ticket files — invalid YAML in frontmatter, missing required fields, or typos in field values are silently accepted. This is tracked as ticket **tr-v181** (Add ticket file validation).
+
 **Cost**: One `cargo build --release` + copy binary. **Benefit**: Tickets in the repo, work offline, zero setup for any agent or script.
