@@ -171,7 +171,11 @@ impl Storage {
             notes: None,
         };
 
-        let ticket = Ticket { metadata, data };
+        let ticket = Ticket {
+            metadata,
+            data,
+            non_standard_sections: Vec::new(),
+        };
         let content = ticket.to_string();
 
         let path = self.ticket_path(&id);
@@ -387,6 +391,11 @@ impl SearchQuery {
 pub struct Ticket {
     pub metadata: Metadata,
     pub data: Data,
+    /// `##` section headings in the body that are not part of the known schema
+    /// (description-before-first-heading / Design / Acceptance Criteria / Notes).
+    /// Their content is parsed but not retained, so `tk show` cannot render it.
+    /// Populated to warn the user instead of silently dropping the text.
+    pub non_standard_sections: Vec<String>,
 }
 
 impl Ticket {
@@ -416,9 +425,13 @@ impl Ticket {
         };
 
         // Parse body
-        let data = parse_body(body_str);
+        let (data, non_standard_sections) = parse_body(body_str);
 
-        Ok(Ticket { metadata, data })
+        Ok(Ticket {
+            metadata,
+            data,
+            non_standard_sections,
+        })
     }
 }
 
@@ -560,7 +573,7 @@ fn parse_frontmatter(yaml_str: &str, default_id: &str) -> Result<Metadata> {
 }
 
 /// Parse the body of a ticket (markdown after frontmatter).
-fn parse_body(body_str: &str) -> Data {
+fn parse_body(body_str: &str) -> (Data, Vec<String>) {
     let body = body_str.trim();
 
     // Extract title (first # heading)
@@ -577,13 +590,25 @@ fn parse_body(body_str: &str) -> Data {
     let acceptance = sections.get("Acceptance Criteria").cloned();
     let notes = sections.get("Notes").map(|n| parse_notes(n));
 
-    Data {
-        title,
-        description,
-        design,
-        acceptance,
-        notes,
-    }
+    // Known schema: empty key (description) + these four. Anything else is
+    // parsed but discarded by this struct, so surface it for a display warning.
+    const KNOWN: [&str; 4] = ["", "Design", "Acceptance Criteria", "Notes"];
+    let non_standard: Vec<String> = sections
+        .keys()
+        .filter(|k| !KNOWN.contains(&k.as_str()))
+        .map(|s| s.clone())
+        .collect();
+
+    (
+        Data {
+            title,
+            description,
+            design,
+            acceptance,
+            notes,
+        },
+        non_standard,
+    )
 }
 
 /// Split body into sections by ## headings.

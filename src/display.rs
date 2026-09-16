@@ -21,6 +21,30 @@ pub fn format_ticket_show(
 ) -> String {
     let mut out = String::new();
 
+    // Warn (stderr) when the body uses `##` sections outside the known schema
+    // (Design / Acceptance Criteria / Notes). Their content is parsed but not
+    // retained, so it is silently dropped from this view — make that visible
+    // rather than let `tk show` look like an empty ticket.
+    if !ticket.non_standard_sections.is_empty() {
+        eprintln!(
+            "warning: ticket {} has non-standard section(s) not shown here: {}\n",
+            ticket.metadata.id,
+            ticket
+                .non_standard_sections
+                .iter()
+                .map(|s| format!("## {}", s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        eprintln!(
+            "  tk only renders: (description before first ##), ## Design, ## Acceptance Criteria, ## Notes.\n"
+        );
+        eprintln!(
+            "  Read the file directly (.tickets/{}.md) for the full body.\n",
+            ticket.metadata.id
+        );
+    }
+
     // Frontmatter with enhanced fields
     out.push_str(&format!("id: {}\n", ticket.metadata.id));
     out.push_str(&format!("status: {}\n", ticket.metadata.status));

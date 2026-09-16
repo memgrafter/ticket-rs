@@ -3,7 +3,7 @@ id: tr-yeuy
 status: open
 open: true
 deps: []
-links: []
+links: [tr-zoaf]
 created: 2026-07-20T02:02:43Z
 type: feature
 priority: 1

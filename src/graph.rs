@@ -380,6 +380,7 @@ mod tests {
                 acceptance: None,
                 notes: None,
             },
+            non_standard_sections: Vec::new(),
         }
     }
 
