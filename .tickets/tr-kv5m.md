@@ -7,7 +7,7 @@ links: []
 created: 2026-06-22T06:15:43Z
 type: feature
 priority: 1
-assignee: trent
+assignee: memgrafter
 tags: [ux, cli]
 ---
 # Add --description-file flag to tk create
