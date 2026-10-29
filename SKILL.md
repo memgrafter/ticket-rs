@@ -34,7 +34,7 @@ When you need to track work items, dependencies, or blockers without leaving the
 | Create a ticket | `tk create "Title" [-t type] [-p priority] [-a assignee] [--tags x,y] [-d description]` |
 | Change status | `tk start <id>` / `tk close <id>` / `tk reopen <id>` (or `tk status <id> <s>`) |
 | Block / unblock | `tk dep <id> <dep_id>` / `tk undep <id> <dep_id>` |
-| Symmetric link | `tk link <id> <other_id>` / `tk unlink <id> <other_id>` |
+| Symmetric link | `tk link <id> <other_id>...` / `tk unlink <id> <other_id>...` — links the first id to each other id (star), not the others to each other; `--all-pairs` for every pair |
 | List / filter | `tk ls [--status S] [--tags x,y] [-s "search"]` |
 | What's actionable | `tk ready` / `tk blocked` |
 | Recently closed | `tk closed [--limit N]` |

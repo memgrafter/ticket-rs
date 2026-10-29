@@ -11,11 +11,9 @@ use std::str;
 
 /// Get the path to the built binary.
 fn binary_path() -> PathBuf {
-    // We need to find the binary. During `cargo test`, the binary is built.
-    // Use CARGO_MANIFEST_DIR to find it.
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = manifest_dir.join("target").join("debug");
-    target_dir.join("tk")
+    // Cargo builds the `tk` bin before integration tests and sets this to its
+    // path, so the tests follow CARGO_TARGET_DIR instead of a stale ./target copy.
+    PathBuf::from(env!("CARGO_BIN_EXE_tk"))
 }
 
 /// Helper to run the ticket binary with args in a given working directory.
@@ -424,6 +422,152 @@ fn test_unlink() {
     let content2 = t.read_ticket_file(&id2);
     assert!(!content1.contains(&id2) || content1.contains("links: []"),
         "First should have no links after unlink: {}", content1);
+}
+
+/// Return the `links:` frontmatter line of a ticket file.
+fn links_line(content: &str) -> String {
+    content
+        .lines()
+        .find(|l| l.starts_with("links:"))
+        .unwrap_or_else(|| panic!("no links: line in {}", content))
+        .to_string()
+}
+
+#[test]
+fn test_link_two_tickets_output_names_pair() {
+    let t = TicketTest::new();
+    let a = t.create("A");
+    let b = t.create("B");
+    let out = t.run_ok(&["link", &a, &b]);
+    assert_eq!(out, format!("Added link: {} <-> {}", a, b));
+
+    // Linking again changes nothing and says so.
+    let out = t.run_ok(&["link", &a, &b]);
+    assert_eq!(out, format!("Already linked: {} <-> {}", a, b));
+    assert_eq!(links_line(&t.read_ticket_file(&a)), format!("links: [{}]", b));
+    assert_eq!(links_line(&t.read_ticket_file(&b)), format!("links: [{}]", a));
+}
+
+#[test]
+fn test_link_star_by_default() {
+    let t = TicketTest::new();
+    let a = t.create("Hub");
+    let b = t.create("B");
+    let c = t.create("C");
+    let d = t.create("D");
+    let out = t.run_ok(&["link", &a, &b, &c, &d]);
+    assert!(out.contains(&format!("Added link: {} <-> {}", a, b)), "{}", out);
+    assert!(out.contains(&format!("Added link: {} <-> {}", a, c)), "{}", out);
+    assert!(out.contains(&format!("Added link: {} <-> {}", a, d)), "{}", out);
+    assert!(out.contains("Added 3 link(s); 0 already existed"), "{}", out);
+
+    assert_eq!(
+        links_line(&t.read_ticket_file(&a)),
+        format!("links: [{}, {}, {}]", b, c, d)
+    );
+    // The others link only to the hub, not to each other.
+    for other in [&b, &c, &d] {
+        assert_eq!(links_line(&t.read_ticket_file(other)), format!("links: [{}]", a));
+    }
+}
+
+#[test]
+fn test_link_star_reports_existing_pairs() {
+    let t = TicketTest::new();
+    let a = t.create("Hub");
+    let b = t.create("B");
+    let c = t.create("C");
+    t.run_ok(&["link", &a, &b]);
+    let out = t.run_ok(&["link", &a, &b, &c, &c]);
+    assert_eq!(
+        out,
+        format!(
+            "Already linked: {a} <-> {b}\nAdded link: {a} <-> {c}\nAdded 1 link(s); 1 already existed"
+        )
+    );
+    assert_eq!(
+        links_line(&t.read_ticket_file(&a)),
+        format!("links: [{}, {}]", b, c)
+    );
+}
+
+#[test]
+fn test_link_all_pairs() {
+    let t = TicketTest::new();
+    let a = t.create("A");
+    let b = t.create("B");
+    let c = t.create("C");
+    let out = t.run_ok(&["link", "--all-pairs", &a, &b, &c]);
+    assert!(out.contains(&format!("Added link: {} <-> {}", b, c)), "{}", out);
+    assert!(out.contains("Added 3 link(s)"), "{}", out);
+    assert_eq!(links_line(&t.read_ticket_file(&a)), format!("links: [{}, {}]", b, c));
+    assert_eq!(links_line(&t.read_ticket_file(&b)), format!("links: [{}, {}]", a, c));
+    assert_eq!(links_line(&t.read_ticket_file(&c)), format!("links: [{}, {}]", a, b));
+
+    // --mesh is an alias.
+    let d = t.create("D");
+    let out = t.run_ok(&["link", &b, &c, &d, "--mesh"]);
+    assert!(out.contains("Added 2 link(s); 1 already existed"), "{}", out);
+}
+
+#[test]
+fn test_link_rejects_self_and_single_id() {
+    let t = TicketTest::new();
+    let a = t.create("A");
+    let err = t.run_fail(&["link", &a, &a]);
+    assert!(err.contains("itself"), "{}", err);
+    t.run_fail(&["link", &a]);
+    t.run_fail(&["unlink", &a]);
+    assert_eq!(links_line(&t.read_ticket_file(&a)), "links: []");
+}
+
+#[test]
+fn test_unlink_two_ids() {
+    let t = TicketTest::new();
+    let a = t.create("A");
+    let b = t.create("B");
+    t.run_ok(&["link", &a, &b]);
+    let out = t.run_ok(&["unlink", &a, &b]);
+    assert_eq!(out, format!("Removed link: {} <-> {}", a, b));
+    assert_eq!(links_line(&t.read_ticket_file(&a)), "links: []");
+    assert_eq!(links_line(&t.read_ticket_file(&b)), "links: []");
+
+    let out = t.run_ok(&["unlink", &b, &a]);
+    assert_eq!(out, format!("Not linked: {} <-> {}", b, a));
+}
+
+#[test]
+fn test_unlink_star_undoes_star_link() {
+    let t = TicketTest::new();
+    let a = t.create("Hub");
+    let b = t.create("B");
+    let c = t.create("C");
+    let d = t.create("D");
+    // A pre-existing link between two of the others must survive.
+    t.run_ok(&["link", &b, &c]);
+    t.run_ok(&["link", &a, &b, &c, &d]);
+
+    let out = t.run_ok(&["unlink", &a, &b, &c, &d]);
+    assert!(out.contains(&format!("Removed link: {} <-> {}", a, d)), "{}", out);
+    assert!(out.contains("Removed 3 link(s); 0 were not linked"), "{}", out);
+    assert_eq!(links_line(&t.read_ticket_file(&a)), "links: []");
+    assert_eq!(links_line(&t.read_ticket_file(&b)), format!("links: [{}]", c));
+    assert_eq!(links_line(&t.read_ticket_file(&c)), format!("links: [{}]", b));
+    assert_eq!(links_line(&t.read_ticket_file(&d)), "links: []");
+}
+
+#[test]
+fn test_unlink_all_pairs() {
+    let t = TicketTest::new();
+    let a = t.create("A");
+    let b = t.create("B");
+    let c = t.create("C");
+    t.run_ok(&["link", "--all-pairs", &a, &b, &c]);
+    let out = t.run_ok(&["unlink", "--all-pairs", &a, &b, &c]);
+    assert!(out.contains("Removed 3 link(s)"), "{}", out);
+    for id in [&a, &b, &c] {
+        assert_eq!(links_line(&t.read_ticket_file(id)), "links: []");
+    }
 }
 
 // ---------------------------------------------------------------------------

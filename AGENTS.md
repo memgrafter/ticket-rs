@@ -9,7 +9,7 @@ Git-backed ticket system. Markdown `.tickets/<id>.md` with YAML frontmatter. Typ
 | `create [title]` | `-d, --design, --acceptance, -t, -p, -a, --external-ref, --parent, --tags` | Prints ID. Defaults: task, P2, assignee=git user.name |
 | `status <id> <s>` | `open\|in_progress\|closed` | `start`, `close`, `reopen` aliases |
 | `dep\|undep <id> <dep>` | | Asymmetric blocking. Both IDs validated/resolved |
-| `link <ids...>` | `unlink <id> <target>` | Symmetric. Stored in both files |
+| `link\|unlink <id> <id>...` | `--all-pairs` (alias `--mesh`) | Symmetric, stored in both files. Star by default: first id paired with each other id. `--all-pairs` = every pair. Prints each pair added/removed; already-linked (or not-linked) pairs reported, not duplicated. Self-link errors |
 | `ls` | `--status, -a, -T, --tags, -s` | Filters + full-text search on title. Sort: priority asc, ID asc |
 | `ready\|blocked` | `-a, -T` | Ready = all deps closed. Blocked = ≥1 open dep |
 | `closed` | `--limit=N` (20) | Recently closed, sorted by created DESC |
@@ -78,4 +78,4 @@ tags: [ui, backend]
 cargo build -r     # release: target/release/ticket-rs
 ```
 
-Tests: 84 total (36 unit + 48 integration). All passing, clean clippy.
+Tests: 116 total (39 unit + 77 integration). Integration tests find the binary via `CARGO_BIN_EXE_tk`, so `CARGO_TARGET_DIR` works.

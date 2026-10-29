@@ -50,6 +50,13 @@ tk dep my-project-a1b2 my-project-c3d4
 tk link my-project-a1b2 my-project-c3d4
 tk unlink my-project-a1b2 my-project-c3d4
 
+# Link one ticket to several others (star: a1b2 <-> each, not c3d4 <-> e5f6)
+tk link my-project-a1b2 my-project-c3d4 my-project-e5f6
+tk unlink my-project-a1b2 my-project-c3d4 my-project-e5f6   # undo the batch
+
+# Link every pair (full mesh)
+tk link --all-pairs my-project-a1b2 my-project-c3d4 my-project-e5f6
+
 # List, filter, search
 tk ls
 tk ls --status open --tags ui -s "login"
@@ -159,8 +166,8 @@ Commit these files. Diff them. Review them. They're just text.
 | `start` / `close` / `reopen` | `<id>` | Shorthands for common transitions |
 | `dep <id> <dep_id>` | | Add dependency (blocking) |
 | `undep <id> <dep_id>` | | Remove dependency |
-| `link <ids...>` | | Symmetric link |
-| `unlink <id> <target>` | | Remove link |
+| `link <id> <id>...` | `--all-pairs` (`--mesh`) | Symmetric link from the first id to each other id; `--all-pairs` links every pair. Prints each pair |
+| `unlink <id> <id>...` | `--all-pairs` (`--mesh`) | Remove links, same shape as `link` (undoes a batch in one call) |
 | `ls` | `--status, -a, -T, --tags, -s` | List with filters + full-text search |
 | `ready` | `-a, -T` | Tickets ready to work on |
 | `blocked` | `-a, -T` | Tickets waiting on deps |

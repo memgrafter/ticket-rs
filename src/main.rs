@@ -88,14 +88,32 @@ enum Command {
         id: String,
         dep_id: String,
     },
-    /// Link tickets together (symmetric)
+    /// Link the first ticket to each of the others (symmetric)
+    ///
+    /// `tk link A B C` adds A <-> B and A <-> C (a star around A). B and C
+    /// are not linked to each other unless you pass --all-pairs.
+    /// Each added pair is printed; pairs that were already linked are reported
+    /// and left alone.
     Link {
+        /// First id is the hub; every other id is linked to it
+        #[arg(value_name = "ID", num_args = 2.., required = true)]
         ids: Vec<String>,
+        /// Link every pair of the given tickets (full mesh) instead of a star
+        #[arg(long = "all-pairs", visible_alias = "mesh")]
+        all_pairs: bool,
     },
-    /// Remove link between tickets
+    /// Remove the links between the first ticket and each of the others
+    ///
+    /// Same shape as `link`: `tk unlink A B C` removes A <-> B and A <-> C,
+    /// so a batch added by `tk link A B C` is undone in one call.
+    /// Use --all-pairs to undo a `tk link --all-pairs` batch.
     Unlink {
-        id: String,
-        target_id: String,
+        /// First id is the hub; its link to every other id is removed
+        #[arg(value_name = "ID", num_args = 2.., required = true)]
+        ids: Vec<String>,
+        /// Remove the link between every pair of the given tickets
+        #[arg(long = "all-pairs", visible_alias = "mesh")]
+        all_pairs: bool,
     },
     /// List tickets with optional filters
     #[command(alias = "list")]
@@ -209,8 +227,8 @@ fn main() -> Result<()> {
         Command::Status { id, status } => cmd_status(&id, &status),
         Command::Dep { id, dep_id } => cmd_dep_add(&id, &dep_id),
         Command::Undep { id, dep_id } => cmd_dep_remove(&id, &dep_id),
-        Command::Link { ids } => cmd_link(&ids),
-        Command::Unlink { id, target_id } => cmd_unlink(&id, &target_id),
+        Command::Link { ids, all_pairs } => cmd_link(&ids, all_pairs),
+        Command::Unlink { ids, all_pairs } => cmd_unlink(&ids, all_pairs),
         Command::Ls {
             status,
             open,
@@ -387,71 +405,137 @@ fn cmd_dep_remove(id: &str, dep_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_link(ids: &[String]) -> Result<()> {
+/// Build the unordered ticket pairs that `link` / `unlink` act on.
+///
+/// Star (default): the first id paired with each of the others.
+/// All pairs: every pair of distinct ids. Repeated ids are dropped, and a
+/// ticket paired with itself is an error.
+fn link_pairs(ids: &[String], all_pairs: bool) -> Result<Vec<(String, String)>> {
     if ids.len() < 2 {
-        bail!("Usage: tk link <id> <id> [id...]");
+        bail!("need at least two ticket ids");
     }
-
-    let storage = make_storage(false)?;
-    let mut resolved_ids = Vec::new();
+    let mut unique: Vec<&String> = Vec::new();
     for id in ids {
-        resolved_ids.push(storage.resolve_id(id)?);
-    }
-
-    let mut total_links = 0;
-    for (i, id) in resolved_ids.iter().enumerate() {
-        let ticket = storage.read(id)?;
-        let mut new_links = ticket.metadata.links.clone();
-
-        for (j, other) in resolved_ids.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            if !new_links.contains(other) {
-                new_links.push(other.clone());
-                total_links += 1;
-            }
-        }
-
-        if !new_links.eq(&ticket.metadata.links) {
-            storage.update_field(id, "links", &format_yaml_array(&new_links))?;
+        if !unique.contains(&id) {
+            unique.push(id);
         }
     }
+    if unique.len() < 2 {
+        bail!("a ticket cannot be linked to itself ({})", ids[0]);
+    }
 
-    if total_links == 0 {
-        println!("All links already exist");
+    let mut pairs = Vec::new();
+    if all_pairs {
+        for (i, a) in unique.iter().enumerate() {
+            for b in &unique[i + 1..] {
+                pairs.push(((*a).clone(), (*b).clone()));
+            }
+        }
     } else {
-        println!(
-            "Added {} link(s) between {} tickets",
-            total_links,
-            resolved_ids.len()
-        );
+        let hub = &ids[0];
+        if ids[1..].contains(hub) {
+            bail!("a ticket cannot be linked to itself ({})", hub);
+        }
+        for other in &unique[1..] {
+            pairs.push((hub.clone(), (*other).clone()));
+        }
+    }
+    Ok(pairs)
+}
+
+/// Ticket id -> that ticket's `links` list.
+type LinkMap = HashMap<String, Vec<String>>;
+
+/// Resolve ids, then load the current `links` of every ticket involved.
+fn load_links(storage: &Storage, ids: &[String]) -> Result<(Vec<String>, LinkMap)> {
+    let mut resolved = Vec::new();
+    for id in ids {
+        resolved.push(storage.resolve_id(id)?);
+    }
+    let mut links = HashMap::new();
+    for id in &resolved {
+        if !links.contains_key(id) {
+            links.insert(id.clone(), storage.read(id)?.metadata.links);
+        }
+    }
+    Ok((resolved, links))
+}
+
+/// Write back the `links` field of each ticket whose links changed.
+fn save_links(
+    storage: &Storage,
+    order: &[String],
+    before: &LinkMap,
+    after: &LinkMap,
+) -> Result<()> {
+    let mut written: Vec<&String> = Vec::new();
+    for id in order {
+        if written.contains(&id) {
+            continue;
+        }
+        written.push(id);
+        if before[id] != after[id] {
+            storage.update_field(id, "links", &format_yaml_array(&after[id]))?;
+        }
     }
     Ok(())
 }
 
-fn cmd_unlink(id: &str, target_id: &str) -> Result<()> {
+fn cmd_link(ids: &[String], all_pairs: bool) -> Result<()> {
     let storage = make_storage(false)?;
-    let resolved_id = storage.resolve_id(id)?;
-    let resolved_target = storage.resolve_id(target_id)?;
+    let (resolved, before) = load_links(&storage, ids)?;
+    let pairs = link_pairs(&resolved, all_pairs)?;
 
-    for rid in &[resolved_id.clone(), resolved_target.clone()] {
-        let ticket = storage.read(rid)?;
-        if !ticket.metadata.links.contains(&resolved_target)
-            && !ticket.metadata.links.contains(&resolved_id)
-        {
+    let mut after = before.clone();
+    let (mut added, mut existing) = (0, 0);
+    for (a, b) in &pairs {
+        let a_has = after[a].contains(b);
+        let b_has = after[b].contains(a);
+        if a_has && b_has {
+            println!("Already linked: {} <-> {}", a, b);
+            existing += 1;
             continue;
         }
-        let new_links: Vec<String> = ticket
-            .metadata
-            .links
-            .into_iter()
-            .filter(|l| l != &resolved_id && l != &resolved_target)
-            .collect();
-        storage.update_field(rid, "links", &format_yaml_array(&new_links))?;
+        if !a_has {
+            after.get_mut(a).unwrap().push(b.clone());
+        }
+        if !b_has {
+            after.get_mut(b).unwrap().push(a.clone());
+        }
+        println!("Added link: {} <-> {}", a, b);
+        added += 1;
     }
+    save_links(&storage, &resolved, &before, &after)?;
 
-    println!("Removed link: {} <-> {}", resolved_id, resolved_target);
+    if pairs.len() > 1 {
+        println!("Added {} link(s); {} already existed", added, existing);
+    }
+    Ok(())
+}
+
+fn cmd_unlink(ids: &[String], all_pairs: bool) -> Result<()> {
+    let storage = make_storage(false)?;
+    let (resolved, before) = load_links(&storage, ids)?;
+    let pairs = link_pairs(&resolved, all_pairs)?;
+
+    let mut after = before.clone();
+    let (mut removed, mut missing) = (0, 0);
+    for (a, b) in &pairs {
+        if !after[a].contains(b) && !after[b].contains(a) {
+            println!("Not linked: {} <-> {}", a, b);
+            missing += 1;
+            continue;
+        }
+        after.get_mut(a).unwrap().retain(|l| l != b);
+        after.get_mut(b).unwrap().retain(|l| l != a);
+        println!("Removed link: {} <-> {}", a, b);
+        removed += 1;
+    }
+    save_links(&storage, &resolved, &before, &after)?;
+
+    if pairs.len() > 1 {
+        println!("Removed {} link(s); {} were not linked", removed, missing);
+    }
     Ok(())
 }
 
@@ -815,6 +899,52 @@ fn format_yaml_array(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn test_link_pairs_two_ids() {
+        let expected = pairs(&[("a", "b")]);
+        assert_eq!(link_pairs(&ids(&["a", "b"]), false).unwrap(), expected);
+        assert_eq!(link_pairs(&ids(&["a", "b"]), true).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_link_pairs_star_by_default() {
+        let got = link_pairs(&ids(&["a", "b", "c", "d"]), false).unwrap();
+        assert_eq!(got, pairs(&[("a", "b"), ("a", "c"), ("a", "d")]));
+    }
+
+    #[test]
+    fn test_link_pairs_all_pairs() {
+        let got = link_pairs(&ids(&["a", "b", "c", "d"]), true).unwrap();
+        assert_eq!(
+            got,
+            pairs(&[("a", "b"), ("a", "c"), ("a", "d"), ("b", "c"), ("b", "d"), ("c", "d")])
+        );
+    }
+
+    #[test]
+    fn test_link_pairs_drops_repeated_ids() {
+        let got = link_pairs(&ids(&["a", "b", "c", "b"]), false).unwrap();
+        assert_eq!(got, pairs(&[("a", "b"), ("a", "c")]));
+        let got = link_pairs(&ids(&["a", "b", "a", "b"]), true).unwrap();
+        assert_eq!(got, pairs(&[("a", "b")]));
+    }
+
+    #[test]
+    fn test_link_pairs_rejects_self_link() {
+        assert!(link_pairs(&ids(&["a", "a"]), false).is_err());
+        assert!(link_pairs(&ids(&["a", "a"]), true).is_err());
+        assert!(link_pairs(&ids(&["a", "b", "a"]), false).is_err());
+        assert!(link_pairs(&ids(&["a"]), false).is_err());
+    }
 
     #[test]
     fn test_matches_jq_filter() {
