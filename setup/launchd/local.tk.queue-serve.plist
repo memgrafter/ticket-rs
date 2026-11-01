@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: setup/queue.sh install replaces __HOME__. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.tk.queue-serve</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/tk</string>
+        <string>queue</string>
+        <string>serve</string>
+        <string>--port</string>
+        <string>7878</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/tk/queue-serve.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/tk/queue-serve.log</string>
+</dict>
+</plist>
