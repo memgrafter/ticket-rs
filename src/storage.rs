@@ -50,7 +50,8 @@ impl Storage {
         }
 
         let cwd = std::env::current_dir().context("Failed to get current directory")?;
-        if let Some(dir) = find_tickets_dir(&cwd) {
+        let reserved = home_tickets_dir();
+        if let Some(dir) = find_tickets_dir(&cwd, reserved.as_deref()) {
             return Ok(Storage {
                 dir,
                 index: RefCell::new(Index::default()),
@@ -59,6 +60,13 @@ impl Storage {
 
         if is_write {
             let p = cwd.join(".tickets");
+            if is_same_dir(&p, reserved.as_deref()) {
+                bail!(
+                    "refusing to keep tickets in {} (reserved for the tk queue)\n\
+                     Run tk in a project directory, or set TICKETS_DIR",
+                    p.display()
+                );
+            }
             fs::create_dir_all(&p).context("Failed to create .tickets directory")?;
             Ok(Storage {
                 dir: p,
@@ -773,11 +781,35 @@ fn insert_open_field(content: &str) -> Option<(String, bool)> {
 }
 
 /// Walk parent directories to find .tickets/.
-fn find_tickets_dir(start: &Path) -> Option<PathBuf> {
+/// `$HOME/.tickets` holds the global tk queue file, not a project's tickets.
+/// If parent-walking found it, every directory under `$HOME` without its own
+/// `.tickets` would silently share it, so the walk skips it.
+pub fn home_tickets_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".tickets"))
+}
+
+fn is_same_dir(a: &Path, b: Option<&Path>) -> bool {
+    let Some(b) = b else { return false };
+    if a == b {
+        return true;
+    }
+    // Compare the parents: `a` may not exist yet (about to be created).
+    let canon = |p: &Path| {
+        let parent = p.parent().and_then(|d| fs::canonicalize(d).ok());
+        (parent, p.file_name().map(|n| n.to_os_string()))
+    };
+    let (pa, na) = canon(a);
+    pa.is_some() && (pa, na) == canon(b)
+}
+
+fn find_tickets_dir(start: &Path, skip: Option<&Path>) -> Option<PathBuf> {
     let mut dir = Some(start.to_path_buf());
     while let Some(ref d) = dir {
-        if d.join(".tickets").is_dir() {
-            return Some(d.join(".tickets"));
+        let candidate = d.join(".tickets");
+        if candidate.is_dir() && !is_same_dir(&candidate, skip) {
+            return Some(candidate);
         }
         dir = d.parent().map(|p| p.to_path_buf());
     }
@@ -787,6 +819,31 @@ fn find_tickets_dir(start: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_find_tickets_dir_skips_reserved_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = home.join("code/project");
+        fs::create_dir_all(home.join(".tickets")).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let reserved = home.join(".tickets");
+
+        assert_eq!(find_tickets_dir(&project, Some(&reserved)), None);
+        assert_eq!(find_tickets_dir(&project, None), Some(reserved.clone()));
+
+        fs::create_dir_all(project.join(".tickets")).unwrap();
+        assert_eq!(
+            find_tickets_dir(&project, Some(&reserved)),
+            Some(project.join(".tickets"))
+        );
+        // A .tickets above $HOME is still found.
+        fs::create_dir_all(tmp.path().join(".tickets")).unwrap();
+        assert_eq!(
+            find_tickets_dir(&home.join("code"), Some(&reserved)),
+            Some(tmp.path().join(".tickets"))
+        );
+    }
 
     #[test]
     fn test_parse_yaml_array() {

@@ -1125,3 +1125,56 @@ fn test_list_with_open_closed_filter() {
     assert!(out.contains(&id_closed), "closed ticket should appear: {}", out);
     assert!(!out.contains(&id_open), "open ticket should not appear in --closed: {}", out);
 }
+/// Run tk with `HOME` set to `home` (and no queue or TICKETS_DIR from the environment).
+fn tk_with_home(dir: &Path, home: &Path, args: &[&str]) -> Output {
+    Command::new(binary_path())
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env_remove("TICKETS_DIR")
+        .env_remove("TK_QUEUE_URL")
+        .output()
+        .expect("Failed to run tk command")
+}
+
+#[test]
+fn test_home_tickets_dir_is_not_used_by_parent_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let project = home.join("code").join("project");
+    fs::create_dir_all(home.join(".tickets")).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        home.join(".tickets").join("hom-0001.md"),
+        "---\nid: hom-0001\nstatus: open\nopen: true\ndeps: []\nlinks: []\ncreated: 2026-11-01T00:00:00Z\ntype: task\npriority: 2\n---\n# In home\n",
+    )
+    .unwrap();
+
+    // Reads below $HOME do not fall back to ~/.tickets.
+    let out = tk_with_home(&project, &home, &["ls"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no .tickets directory found"));
+    assert!(!tk_with_home(&project, &home, &["show", "hom-0001"]).status.success());
+
+    // create below $HOME makes the project's own .tickets.
+    let out = tk_with_home(&project, &home, &["create", "Mine"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(project.join(".tickets").join(format!("{}.md", id)).exists());
+
+    // create in $HOME itself is refused instead of using ~/.tickets.
+    let out = tk_with_home(&home, &home, &["create", "Not here"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved for the tk queue"));
+    assert_eq!(fs::read_dir(home.join(".tickets")).unwrap().count(), 1);
+
+    // An explicit TICKETS_DIR still works.
+    let out = Command::new(binary_path())
+        .args(["ls"])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("TICKETS_DIR", home.join(".tickets"))
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("hom-0001"));
+}
