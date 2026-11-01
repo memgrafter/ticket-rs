@@ -68,3 +68,48 @@ Shape:
 - HTTP client and server are hand-written on std::net (small HTTP/1.1 subset, Connection: close) to avoid an HTTP crate.
 
 New crate: serde_json 1.0.x (licence "MIT OR Apache-2.0", from its Cargo.toml). Its deps itoa ("MIT OR Apache-2.0"), memchr ("Unlicense OR MIT"), serde_core ("MIT OR Apache-2.0") and zmij are already in Cargo.lock; zmij licence to be read from its Cargo.toml after fetch.
+
+**2026-11-01T15:37:24Z**
+
+Built (agent, 2026-11-01). Commits on main, not pushed: ac0dce8 (decision note), 8204b36 (feature + tests), 30141b6 (docs). Not installed: ~/.local/bin/tk is unchanged.
+
+What it does
+- `tk queue serve [--port 7878] [--data FILE]`: HTTP on 127.0.0.1 only (no flag to change it). Append-only JSONL log (default ~/.local/state/tk/queue.jsonl), one line per change with `seq`; replayed at start; a file lock stops two servers on one log. Rejects a Host other than 127.0.0.1/localhost/::1, and POSTs without header `X-TK-Queue: 1` (blocks browser pages and DNS rebinding). No other auth.
+- With `TK_QUEUE_URL` set, create/status/start/close/reopen/add-note/dep/undep/link/unlink push a full snapshot of each changed ticket (key = repo + id; repo = name of the dir holding .tickets, `TK_QUEUE_REPO` overrides). Queue down -> ticket file saved, stderr "warning: ticket X is saved, but the queue update failed: ...", exit 0. Unset -> no network, output unchanged.
+- Raise without a repo: `tk queue raise "Title" --repo R [-d -t -p -a --tags]` or curl form/JSON POST /raise. Entry id `q-<8 alnum>`, state pending.
+- `tk queue poll [--since N] [--once] [--interval 30] [--exec CMD] [--no-materialize] [--cursor PATH]`: where a .tickets dir is found, first claims and creates that repo's pending raises (external-ref `queue:<raise id>`, a provenance note; idempotent; a claim makes one poller win), then prints changes after the cursor as JSONL and saves the cursor (~/.local/state/tk/cursor-<repo>; `TK_QUEUE_STATE_DIR` moves it). `--exec` gets the change on stdin plus TK_QUEUE_SEQ/REPO/ID/KIND/OP; a failing exec stops the poll and keeps the cursor before that change. Warns if the cursor is past the server's last seq.
+- `tk queue ls [--repo] [--kind ticket|raise] [--json]`, `tk queue show <id> [--repo]`.
+- HTTP API: GET /health, /events?since=N (pages of 1000), /entries?repo=&kind=&state=, /entry?id=&repo=; POST /raise, /push, /claim.
+
+How to run (Mac = repo host)
+  cd ~/code/ticket-rs && cargo build --release      # binary: target/release/tk
+  target/release/tk queue serve                       # keep running (tmux/launchd)
+  ssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:7878:127.0.0.1:7878 vert   # vert's 127.0.0.1:7878 -> Mac
+  export TK_QUEUE_URL=http://127.0.0.1:7878           # in each session that should push/poll
+  cd <repo root> && tk queue poll --interval 30 [--exec CMD]
+On vert (curl only):
+  curl -fsS -H 'X-TK-Queue: 1' --data-urlencode repo=<repo dir name> --data-urlencode "title=..." --data-urlencode "description=$msg" --data-urlencode type=bug --data-urlencode priority=1 --data-urlencode tags=vert http://127.0.0.1:7878/raise
+
+Verified
+- Real vert path: a temporary server on the Mac, one `ssh -R` session ran curl on vert (no installs, nothing left listening on vert); the raise (quotes, &, <>, newline in the description) became a correct ticket file after `tk queue poll --once`.
+- ./test.sh --all:
+  unit (bin): 44 passed; integration: 77 passed (unchanged); queue: 11 passed (tests/queue.rs: create->entry, every update command updates the same entry, raise from a no-repo client -> poller creates the ticket (tk raise + curl-style form), two clients/repos/hosts, two pollers -> one ticket, server down -> create/start succeed with warning and poll/ls/raise fail, not configured -> no output change, poll cursor/--once/--since/--exec incl. exec failure, poll loop, server restart keeps entries and seq + second server refused, browser-style requests refused).
+  Clippy step fails on a lint that was already in src/storage.rs:596 before this work (explicit clone closure); none in the new code.
+
+Not done
+- No service setup: nothing keeps the server or the tunnel running (launchd/tmux/autossh), and nothing is installed.
+- When the tunnel or server is down, vert's curl fails (curl -f gives a non-zero exit); its script must retry or keep a local spool.
+- No dedupe key: a batch script that raises the same failure every run makes one ticket per raise.
+- Hand edits to ticket files (`tk edit`) are not pushed; the next tk change to that ticket pushes the full snapshot.
+- New ticket ids from raises use the poller's current dir name for the prefix (same as tk create): run poll from the repo root.
+- No log compaction; all events are kept in memory (fine for tens a day).
+- Socket listener / OS wake: out of scope (owner's later design).
+- Text from a raise goes into ticket files unchanged (only newlines in the title are flattened). Anyone who can reach the port can put text into tickets that agents read.
+
+Decisions for the owner
+1. Install: `cp target/release/tk ~/.local/bin/tk` after review. Sessions without TK_QUEUE_URL behave as before.
+2. Where the server runs. Recommended: on the Mac (repo and poller are there; the Mac already reaches vert, so it starts the `ssh -R`). Other choice: on vert (always on), with the Mac using `ssh -L`; then every Mac tk change depends on that tunnel.
+3. How to keep server + tunnel alive (launchd agent, tmux window, or autossh) and on which port (default 7878).
+4. Set TK_QUEUE_URL in the shell profile (all sessions push) or only in chosen sessions.
+5. Which repo name vert raises into, and what the poller's --exec does.
+6. Whether to add a dedupe key for repeated raises from batch scripts.
