@@ -9,7 +9,7 @@ When you need to track work items, dependencies, or blockers without leaving the
 
 - **In-repo, no drift** — ticket changes are in the same commits as code changes. `git log` shows both. They can't get out of sync.
 - **Zero setup for the agent** — `tk create "thing"` just works. No env vars, no config file, no auth.
-- **Works offline / in CI** — no network calls, no API keys, no rate limits.
+- **Works offline / in CI** — no network calls unless you set `TK_QUEUE_URL` (optional queue), no API keys, no rate limits.
 - **Dependency-aware** — `tk ready` tells you what's actionable right now. `tk blocked` shows what's stuck. `tk dep-tree` renders the graph.
 - **JSONL output for scripts** — `tk query '.status == "open"'` pipes cleanly into `jq`, CI checks, or another agent.
 
@@ -43,6 +43,9 @@ When you need to track work items, dependencies, or blockers without leaving the
 | Query (JSONL) | `tk query ['.field == "val"']` |
 | Dep tree | `tk dep-tree <id> [--full]` |
 | Detect cycles | `tk dep-cycle` |
+| Queue: watch changes | `tk queue poll --once` (JSONL; needs `TK_QUEUE_URL`) / `tk queue poll --interval 30 --exec CMD` |
+| Queue: raise without a repo | `tk queue raise "Title" --repo NAME [-d text]` |
+| Queue: inspect | `tk queue ls [--repo R]` / `tk queue show <id>` |
 | Help | `tk --help` / `tk <cmd> --help` |
 
 ## Example session
@@ -78,6 +81,10 @@ tk query '.status == "open" and .deps != []'
 `.tickets/` folder in the project root. Each ticket is `<id>.md` with YAML frontmatter. `tk` walks parent dirs to find it. No database, no server, no env setup — just a binary on `$PATH`.
 
 - **To put a ticket in another project, you must `cd` to that directory first** — `tk` walks up from the current working directory to find the nearest `.tickets/`, so it always writes to whichever repo's `.tickets/` it finds in its ancestor chain.
+
+## Queue (optional)
+
+With `TK_QUEUE_URL=http://127.0.0.1:7878` set, every ticket change is also sent to a `tk queue serve` server; failures only warn. Scripts on other hosts raise tickets with `curl -H 'X-TK-Queue: 1' --data-urlencode repo=R --data-urlencode title=... http://127.0.0.1:7878/raise` (through an ssh tunnel). Run `tk queue poll` from the repo root: it creates those tickets and prints changes. See README "Queue".
 
 ## Common pitfalls
 

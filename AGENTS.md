@@ -19,6 +19,10 @@ Git-backed ticket system. Markdown `.tickets/<id>.md` with YAML frontmatter. Typ
 | `dep-tree <id>` | `--full` | Box-drawing. Dedup by default (--full shows all) |
 | `dep-cycle` | | DFS cycle detection on open tickets only |
 | `edit <id>` | | Prints file path (no $EDITOR launch) |
+| `queue serve` | `--port` (7878), `--data` | HTTP on 127.0.0.1 only; append-only JSONL log (default `~/.local/state/tk/queue.jsonl`), replayed at start; file lock = one server per log |
+| `queue raise <title>` | `--repo, -d, -t, -p, -a, --tags` | Raise entry (`q-<8 alnum>`, state pending). No `.tickets` needed |
+| `queue poll` | `--since, --once, --interval, --exec, --no-materialize, --cursor` | JSONL changes after cursor. With `.tickets` found: claim + create its repo's pending raises first (`external-ref: queue:<raise id>`) |
+| `queue ls\|show` | `--repo, --kind, --json` | Current entries |
 
 ## Modules
 
@@ -30,6 +34,8 @@ Git-backed ticket system. Markdown `.tickets/<id>.md` with YAML frontmatter. Typ
 | `id.rs` | ID gen (`dir-prefix-4alphanum`), partial resolution (exact→suffix→prefix→substring) |
 | `graph.rs` | `DependencyGraph` with deps/dependents maps, DFS cycle detection, subtree depth, tree render |
 | `display.rs` | Human-readable show/ls/blocked + JSONL serialization |
+| `queue.rs` | Queue server state/routes, client commands, `mirror()` called after every ticket change |
+| `http.rs` | Minimal HTTP/1.1 client + request parsing on `std::net` (no HTTP crate) |
 
 ## Data Model (from ticket.ts)
 
@@ -68,6 +74,8 @@ tags: [ui, backend]
 - **Sort order**: priority ASC (0 highest), then ID ASC
 - **Tags filter**: intersection (all specified tags must match)
 - **Deps are blocking**: A depends on B means B blocks A
+- **Queue is opt-in**: no `TK_QUEUE_URL` = no network. Push failure = stderr warning, exit 0. Key = repo (dir holding `.tickets`, or `TK_QUEUE_REPO`) + id
+- **Queue server safety**: bind 127.0.0.1 only (no flag); reject non-loopback `Host`; POST needs `X-TK-Queue: 1`
 
 ## Dev
 
@@ -78,4 +86,4 @@ tags: [ui, backend]
 cargo build -r     # release: target/release/ticket-rs
 ```
 
-Tests: 116 total (39 unit + 77 integration). Integration tests find the binary via `CARGO_BIN_EXE_tk`, so `CARGO_TARGET_DIR` works.
+Tests: 132 total (44 unit + 77 integration + 11 queue in `tests/queue.rs`, which start `tk queue serve --port 0`). Integration tests find the binary via `CARGO_BIN_EXE_tk`, so `CARGO_TARGET_DIR` works.
