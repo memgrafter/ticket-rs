@@ -206,7 +206,7 @@ enum QueueCommand {
         /// Port on 127.0.0.1 (0 = any free port)
         #[arg(long, default_value_t = queue::DEFAULT_PORT)]
         port: u16,
-        /// Append-only JSONL log (default ~/.local/state/tk/queue.jsonl)
+        /// Append-only NDJSON log (default ~/.tickets/_global_queue.jsond)
         #[arg(long)]
         data: Option<std::path::PathBuf>,
     },
@@ -227,6 +227,12 @@ enum QueueCommand {
         /// Comma-separated tags
         #[arg(long)]
         tags: Option<String>,
+        /// Queue name (free-form, default "default")
+        #[arg(long)]
+        queue: Option<String>,
+        /// Group key (fingerprint): later raises with the same queue, repo and group add an occurrence to the first one's ticket
+        #[arg(long)]
+        group: Option<String>,
     },
     /// Print queue changes after the cursor as JSONL; where a .tickets dir is found, first create tickets from its pending raises
     Poll {
@@ -245,12 +251,18 @@ enum QueueCommand {
         /// Don't create tickets from pending raises
         #[arg(long)]
         no_materialize: bool,
-        /// Cursor file (default ~/.local/state/tk/cursor-<repo>)
+        /// Cursor file (default ~/.local/state/tk/cursor-<repo>[--<queue>])
         #[arg(long)]
         cursor: Option<std::path::PathBuf>,
+        /// Only this queue's changes and raises
+        #[arg(long)]
+        queue: Option<String>,
     },
     /// List current queue entries (one per repo + id)
     Ls {
+        /// Only this queue
+        #[arg(long)]
+        queue: Option<String>,
         #[arg(long)]
         repo: Option<String>,
         /// ticket or raise
@@ -341,6 +353,8 @@ fn cmd_queue(q: QueueCommand) -> Result<()> {
             priority,
             assignee,
             tags,
+            queue,
+            group,
         } => queue::cmd_raise(queue::RaiseOptions {
             title,
             repo,
@@ -349,6 +363,8 @@ fn cmd_queue(q: QueueCommand) -> Result<()> {
             priority,
             assignee,
             tags,
+            queue,
+            group,
         }),
         QueueCommand::Poll {
             since,
@@ -357,6 +373,7 @@ fn cmd_queue(q: QueueCommand) -> Result<()> {
             exec,
             no_materialize,
             cursor,
+            queue,
         } => queue::cmd_poll(queue::PollOptions {
             since,
             once,
@@ -364,8 +381,14 @@ fn cmd_queue(q: QueueCommand) -> Result<()> {
             exec,
             materialize: !no_materialize,
             cursor,
+            queue,
         }),
-        QueueCommand::Ls { repo, kind, json } => queue::cmd_ls(repo, kind, json),
+        QueueCommand::Ls {
+            queue,
+            repo,
+            kind,
+            json,
+        } => queue::cmd_ls(queue, repo, kind, json),
         QueueCommand::Show { id, repo } => queue::cmd_show(&id, repo),
     }
 }

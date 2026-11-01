@@ -40,9 +40,22 @@ struct Server {
 
 impl Server {
     fn start(data: &Path) -> Self {
-        let mut child = Command::new(bin())
-            .args(["queue", "serve", "--port", "0", "--data"])
-            .arg(data)
+        let mut cmd = Command::new(bin());
+        cmd.args(["queue", "serve", "--port", "0", "--data"])
+            .arg(data);
+        Self::spawn(cmd)
+    }
+
+    /// Start with no --data, so the log goes to `$HOME/.tickets/_global_queue.jsond`.
+    fn start_with_home(home: &Path) -> Self {
+        let mut cmd = Command::new(bin());
+        cmd.args(["queue", "serve", "--port", "0"])
+            .env("HOME", home);
+        Self::spawn(cmd)
+    }
+
+    fn spawn(mut cmd: Command) -> Self {
+        let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -110,6 +123,7 @@ impl Client {
             .env("TK_QUEUE_STATE_DIR", &self.state)
             .env("TK_QUEUE_HOST", &self.host)
             .env_remove("TK_QUEUE_REPO")
+            .env_remove("TK_QUEUE_NAME")
             .env_remove("TICKETS_DIR");
         c
     }
@@ -549,18 +563,23 @@ fn test_queue_poll_loop_sees_new_changes() {
 fn test_queue_server_restart_keeps_entries_and_seq() {
     let data = data_dir();
     let log = data.path().join("q.jsonl");
-    let id;
+    let (id, raise_id);
     {
         let server = Server::start(&log);
         let mac = Client::new("alpha", &server.url, "mac");
         id = mac.ok(&["create", "survives"]);
         mac.ok(&["close", &id]);
+        raise_id = mac.ok(&["queue", "raise", "grouped", "--repo", "alpha", "--group", "g1"]);
     }
     let server = Server::start(&log);
     let mac = Client::new("alpha", &server.url, "mac");
     assert_eq!(mac.entry(&id)["ticket"]["status"], "closed");
     let next = mac.ok(&["create", "after restart"]);
-    assert_eq!(mac.entry(&next)["seq"], 3);
+    assert_eq!(mac.entry(&next)["seq"], 4);
+    // The group index is rebuilt from the log.
+    let again = mac.ok(&["queue", "raise", "grouped", "--repo", "alpha", "--group", "g1"]);
+    assert_eq!(again, raise_id);
+    assert_eq!(mac.entry(&raise_id)["count"], 2);
 
     // A second server on the same log is refused.
     let mut second = Command::new(bin())
@@ -641,4 +660,169 @@ fn test_queue_server_refuses_browser_style_requests() {
         ),
         200
     );
+}
+
+fn ticket_file(client: &Client, id: &str) -> String {
+    std::fs::read_to_string(client.dir.join(".tickets").join(format!("{}.md", id))).unwrap()
+}
+
+#[test]
+fn test_queue_named_queues_filter_entries_events_and_raises() {
+    let data = data_dir();
+    let server = Server::start(&data.path().join("q.jsonl"));
+    let mac = Client::new("alpha", &server.url, "mac").init_repo();
+    let vert = Client::new("batch", &server.url, "vert");
+
+    let plain = mac.ok(&["create", "In default"]);
+    let ops = String::from_utf8_lossy(
+        &mac.command(&["create", "In ops"])
+            .env("TK_QUEUE_NAME", "ops")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(mac.entry(&plain)["queue"], "default");
+    assert_eq!(mac.entry(&ops)["queue"], "ops");
+    // A later change without TK_QUEUE_NAME keeps the ticket in its queue.
+    mac.ok(&["start", &ops]);
+    assert_eq!(mac.entry(&ops)["queue"], "ops");
+
+    let r = vert.ok(&[
+        "queue",
+        "raise",
+        "Mesh failed",
+        "--repo",
+        "alpha",
+        "--queue",
+        "trellis",
+    ]);
+    assert_eq!(vert.entry(&r)["queue"], "trellis");
+
+    let trellis = jsonl(&mac.ok(&["queue", "ls", "--json", "--queue", "trellis"]));
+    assert_eq!(trellis.len(), 1);
+    assert_eq!(trellis[0]["id"], r.as_str());
+    assert!(mac.ok(&["queue", "ls", "--queue", "nope"]).is_empty());
+
+    // Poll one queue: only its raises become tickets, only its changes print.
+    let events = mac.poll_once(&["--queue", "ops"]);
+    assert!(events.iter().all(|e| e["queue"] == "ops"), "{:?}", events);
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        mac.ticket_files().len(),
+        2,
+        "trellis raise must wait for a trellis poller"
+    );
+    assert!(mac.state.join("cursor-alpha--ops").exists());
+
+    let events = mac.poll_once(&["--queue", "trellis"]);
+    let e = mac.entry(&r);
+    assert_eq!(e["state"], "materialized");
+    let ticket = e["ticket_id"].as_str().unwrap();
+    // The ticket made from a raise joins the raise's queue.
+    assert_eq!(mac.entry(ticket)["queue"], "trellis");
+    assert!(
+        events.iter().all(|e| e["queue"] == "trellis"),
+        "{:?}",
+        events
+    );
+}
+
+#[test]
+fn test_queue_raise_groups_add_occurrences_to_one_ticket() {
+    let data = data_dir();
+    let server = Server::start(&data.path().join("q.jsonl"));
+    let mac = Client::new("alpha", &server.url, "mac").init_repo();
+    let vert = Client::new("batch", &server.url, "vert");
+    let raise = |title: &str, desc: &str| {
+        let body = format!(
+            "repo=alpha&queue=trellis&group=oom&host=vert&title={}&description={}",
+            title.replace(' ', "+"),
+            desc.replace(' ', "+")
+        );
+        let (status, body) = post_form(&server.url, "/raise", &body);
+        assert_eq!(status, 200, "{}", body);
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+
+    // Three raises of one group before any poll: one entry, count 3.
+    let first = raise("OOM job 1", "first trace");
+    let id = first["id"].as_str().unwrap().to_string();
+    raise("OOM job 2", "second trace");
+    let third = raise("OOM job 3", "third trace");
+    assert_eq!(third["id"], id.as_str());
+    assert_eq!(third["count"], 3);
+    assert_eq!(third["first_seen"], first["first_seen"]);
+    assert_eq!(third["latest"]["title"], "OOM job 3");
+    assert_eq!(
+        jsonl(&mac.ok(&["queue", "ls", "--json", "--kind", "raise"])).len(),
+        1
+    );
+
+    mac.poll_once(&[]);
+    assert_eq!(mac.ticket_files().len(), 1);
+    let ticket = mac.entry(&id)["ticket_id"].as_str().unwrap().to_string();
+    let file = ticket_file(&mac, &ticket);
+    assert!(file.contains("# OOM job 1"), "{}", file);
+    assert!(
+        file.contains("Raised again 2 time(s), 3 in all"),
+        "{}",
+        file
+    );
+    assert!(file.contains("third trace"), "{}", file);
+    assert_eq!(mac.entry(&id)["noted"], 3);
+
+    // Another occurrence adds one note; polling again adds nothing.
+    raise("OOM job 4", "fourth trace");
+    mac.poll_once(&[]);
+    mac.poll_once(&[]);
+    let file = ticket_file(&mac, &ticket);
+    assert_eq!(file.matches("Raised again").count(), 2, "{}", file);
+    assert!(
+        file.contains("Raised again 1 time(s), 4 in all"),
+        "{}",
+        file
+    );
+    assert_eq!(mac.ticket_files().len(), 1);
+    assert_eq!(mac.entry(&ticket)["op"], "occurrence");
+
+    // A closed group that raises again is reopened as a regression.
+    mac.ok(&["close", &ticket]);
+    raise("OOM job 5", "fifth trace");
+    mac.poll_once(&[]);
+    let file = ticket_file(&mac, &ticket);
+    assert!(file.contains("open: true"), "{}", file);
+    assert!(file.contains("status: open"), "{}", file);
+    assert!(file.contains("Regression:"), "{}", file);
+    assert_eq!(mac.entry(&ticket)["op"], "regression");
+    assert_eq!(mac.entry(&ticket)["ticket"]["open"], true);
+
+    // Same group name in another queue, or no group: separate tickets.
+    vert.ok(&[
+        "queue",
+        "raise",
+        "OOM elsewhere",
+        "--repo",
+        "alpha",
+        "--group",
+        "oom",
+    ]);
+    vert.ok(&["queue", "raise", "No group", "--repo", "alpha"]);
+    vert.ok(&["queue", "raise", "No group", "--repo", "alpha"]);
+    mac.poll_once(&[]);
+    assert_eq!(mac.ticket_files().len(), 4);
+}
+
+#[test]
+fn test_queue_default_log_is_home_tickets_global_queue() {
+    let home = data_dir();
+    let server = Server::start_with_home(home.path());
+    let mac = Client::new("alpha", &server.url, "mac");
+    let id = mac.ok(&["create", "Logged"]);
+    let log =
+        std::fs::read_to_string(home.path().join(".tickets").join("_global_queue.jsond")).unwrap();
+    let lines = jsonl(&log);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["id"], id.as_str());
 }

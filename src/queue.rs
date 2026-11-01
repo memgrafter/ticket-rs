@@ -6,6 +6,12 @@
 //! with a `seq` that orders all changes. The current entries (one per
 //! repo + id) are rebuilt by replaying the file at start.
 //!
+//! Entries carry a free-form queue name (default `default`); the server keeps
+//! per-queue indexes so a filtered read touches only that queue's entries.
+//! Raises may carry a `group` (Sentry-style fingerprint): the first raise of
+//! a (queue, repo, group) makes the entry and later ones count as occurrences
+//! of it.
+//!
 //! Clients find the server through `TK_QUEUE_URL`. Without it, tk never
 //! touches the network.
 
@@ -15,7 +21,7 @@ use crate::types::{CreateOptions, Priority};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -29,6 +35,10 @@ const SERVER_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENTS_PAGE_LIMIT: usize = 1000;
 const RAISE_ID_PREFIX: &str = "q-";
 const RAISE_REF_PREFIX: &str = "queue:";
+pub const DEFAULT_QUEUE: &str = "default";
+const DATA_FILE_NAME: &str = "_global_queue.jsond";
+/// Longest piece of a raise's description copied into an occurrence note.
+const NOTE_EVIDENCE_CHARS: usize = 500;
 
 /// The queue URL from `TK_QUEUE_URL`, if set and non-empty.
 pub fn configured_url() -> Option<String> {
@@ -52,16 +62,32 @@ fn now() -> String {
 
 // ---------------------------------------------------------------- server
 
+type EntryKey = (String, String);
+
 struct QueueState {
     log: File,
     /// (repo, id) -> latest entry.
-    entries: HashMap<(String, String), Value>,
+    entries: HashMap<EntryKey, Value>,
+    /// queue name -> keys of the entries now in that queue.
+    by_queue: HashMap<String, HashSet<EntryKey>>,
+    /// (queue, repo, group) -> id of the group's raise entry.
+    groups: HashMap<(String, String, String), String>,
     /// Every change, in seq order.
     events: Vec<Value>,
+    /// queue name -> positions in `events` of that queue's changes.
+    queue_events: HashMap<String, Vec<usize>>,
     seq: u64,
 }
 
-fn entry_key(v: &Value) -> (String, String) {
+/// Queue name of an entry; lines written before named queues are `default`.
+fn entry_queue(v: &Value) -> &str {
+    match str_field(v, "queue") {
+        "" => DEFAULT_QUEUE,
+        q => q,
+    }
+}
+
+fn entry_key(v: &Value) -> EntryKey {
     (
         str_field(v, "repo").to_string(),
         str_field(v, "id").to_string(),
@@ -94,7 +120,10 @@ impl QueueState {
         let mut state = QueueState {
             log,
             entries: HashMap::new(),
+            by_queue: HashMap::new(),
+            groups: HashMap::new(),
             events: Vec::new(),
+            queue_events: HashMap::new(),
             seq: 0,
         };
         let lines: Vec<String> = BufReader::new(&state.log)
@@ -114,7 +143,32 @@ impl QueueState {
 
     fn apply(&mut self, v: Value) {
         self.seq = self.seq.max(v["seq"].as_u64().unwrap_or(0));
-        self.entries.insert(entry_key(&v), v.clone());
+        let key = entry_key(&v);
+        let queue = entry_queue(&v).to_string();
+        if let Some(old) = self.entries.get(&key) {
+            let old_queue = entry_queue(old);
+            if old_queue != queue {
+                if let Some(keys) = self.by_queue.get_mut(old_queue) {
+                    keys.remove(&key);
+                }
+            }
+        }
+        self.by_queue
+            .entry(queue.clone())
+            .or_default()
+            .insert(key.clone());
+        let group = str_field(&v, "group");
+        if str_field(&v, "kind") == "raise" && !group.is_empty() {
+            self.groups.insert(
+                (queue.clone(), key.0.clone(), group.to_string()),
+                key.1.clone(),
+            );
+        }
+        self.queue_events
+            .entry(queue)
+            .or_default()
+            .push(self.events.len());
+        self.entries.insert(key, v.clone());
         self.events.push(v);
     }
 
@@ -134,13 +188,20 @@ impl QueueState {
     }
 }
 
-pub fn default_data_path() -> PathBuf {
-    state_dir().join("queue.jsonl")
+/// `~/.tickets/_global_queue.jsond` (newline-delimited JSON). Project ticket
+/// lookups skip `~/.tickets`, see `storage::home_tickets_dir`.
+pub fn default_data_path() -> Result<PathBuf> {
+    crate::storage::home_tickets_dir()
+        .map(|d| d.join(DATA_FILE_NAME))
+        .ok_or_else(|| anyhow!("HOME is not set; pass --data"))
 }
 
 /// Run the queue server on 127.0.0.1:`port` until killed.
 pub fn serve(port: u16, data: Option<PathBuf>) -> Result<()> {
-    let path = data.unwrap_or_else(default_data_path);
+    let path = match data {
+        Some(p) => p,
+        None => default_data_path()?,
+    };
     let mut state = QueueState::open(&path)?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
         .with_context(|| format!("cannot listen on 127.0.0.1:{}", port))?;
@@ -226,6 +287,7 @@ fn route(state: &mut QueueState, req: &http::Request) -> Result<Reply> {
         ("POST", "/push") => handle_push(state, &request_params(req)?),
         ("POST", "/raise") => handle_raise(state, &request_params(req)?),
         ("POST", "/claim") => handle_claim(state, &request_params(req)?),
+        ("POST", "/noted") => handle_noted(state, &request_params(req)?),
         ("GET", "/events") => handle_events(state, &req.query),
         ("GET", "/entries") => Ok(handle_entries(state, &req.query)),
         ("GET", "/entry") => handle_entry(state, &req.query),
@@ -275,7 +337,20 @@ fn handle_push(state: &mut QueueState, p: &Map<String, Value>) -> Result<Reply> 
         .filter(|t| t.is_object())
         .ok_or_else(|| anyhow!("missing required object 'ticket'"))?;
 
+    let raise_id = optional(p, "raise_id");
+    // Explicit name, else where this ticket (or the raise it came from) already is.
+    let queue = optional(p, "queue")
+        .or_else(|| state.get(repo, id).map(|e| entry_queue(e).to_string()))
+        .or_else(|| {
+            raise_id
+                .as_ref()
+                .and_then(|r| state.get(repo, r))
+                .map(|e| entry_queue(e).to_string())
+        })
+        .unwrap_or_else(|| DEFAULT_QUEUE.to_string());
+
     let mut entry = Map::new();
+    entry.insert("queue".into(), json!(queue));
     entry.insert("repo".into(), json!(repo));
     entry.insert("id".into(), json!(id));
     entry.insert("kind".into(), json!("ticket"));
@@ -290,7 +365,6 @@ fn handle_push(state: &mut QueueState, p: &Map<String, Value>) -> Result<Reply> 
     if let Some(path) = optional(p, "path") {
         entry.insert("path".into(), json!(path));
     }
-    let raise_id = optional(p, "raise_id");
     if let Some(ref r) = raise_id {
         entry.insert("raise_id".into(), json!(r));
     }
@@ -331,6 +405,33 @@ fn handle_raise(state: &mut QueueState, p: &Map<String, Value>) -> Result<Reply>
         _ => Vec::new(),
     };
 
+    let queue = optional(p, "queue").unwrap_or_else(|| DEFAULT_QUEUE.to_string());
+    let group = optional(p, "group");
+    let host = optional(p, "host").unwrap_or_else(|| "unknown".into());
+    let at = now();
+    let latest = json!({
+        "title": title,
+        "description": optional(p, "description"),
+        "host": host,
+        "at": at,
+    });
+
+    if let Some(ref g) = group {
+        let existing = state
+            .groups
+            .get(&(queue.clone(), repo.to_string(), g.clone()))
+            .and_then(|id| state.get(repo, id))
+            .cloned();
+        if let Some(Value::Object(mut entry)) = existing {
+            let count = entry.get("count").and_then(Value::as_u64).unwrap_or(1) + 1;
+            entry.insert("op".into(), json!("occurrence"));
+            entry.insert("count".into(), json!(count));
+            entry.insert("last_seen".into(), json!(at));
+            entry.insert("latest".into(), latest);
+            return Ok(Reply::json(200, state.record(entry)?));
+        }
+    }
+
     let id = loop {
         let candidate = format!("{}{}", RAISE_ID_PREFIX, random_suffix(8));
         if state.get(repo, &candidate).is_none() {
@@ -338,15 +439,22 @@ fn handle_raise(state: &mut QueueState, p: &Map<String, Value>) -> Result<Reply>
         }
     };
     let mut entry = Map::new();
+    entry.insert("queue".into(), json!(queue));
     entry.insert("repo".into(), json!(repo));
     entry.insert("id".into(), json!(id));
     entry.insert("kind".into(), json!("raise"));
     entry.insert("op".into(), json!("raise"));
-    entry.insert(
-        "host".into(),
-        json!(optional(p, "host").unwrap_or_else(|| "unknown".into())),
-    );
+    entry.insert("host".into(), json!(host));
     entry.insert("state".into(), json!("pending"));
+    if let Some(g) = group {
+        entry.insert("group".into(), json!(g));
+    }
+    entry.insert("count".into(), json!(1));
+    entry.insert("first_seen".into(), json!(at));
+    entry.insert("last_seen".into(), json!(at));
+    entry.insert("latest".into(), latest);
+    // Occurrences the ticket already shows (the first is the ticket itself).
+    entry.insert("noted".into(), json!(1));
     entry.insert(
         "ticket".into(),
         json!({
@@ -395,6 +503,31 @@ fn handle_claim(state: &mut QueueState, p: &Map<String, Value>) -> Result<Reply>
     }
 }
 
+/// The poller wrote occurrences up to `count` into the group's ticket.
+fn handle_noted(state: &mut QueueState, p: &Map<String, Value>) -> Result<Reply> {
+    let repo = required(p, "repo")?;
+    let id = required(p, "id")?;
+    let count = match p.get("count") {
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.parse().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| anyhow!("missing required number 'count'"))?;
+    let Some(Value::Object(mut raise)) = state.get(repo, id).cloned() else {
+        return Ok(Reply::error(
+            404,
+            format!("no raise {} in repo {}", id, repo),
+        ));
+    };
+    let noted = raise.get("noted").and_then(Value::as_u64).unwrap_or(1);
+    if count <= noted {
+        return Ok(Reply::json(200, Value::Object(raise)));
+    }
+    raise.insert("op".into(), json!("noted"));
+    raise.insert("noted".into(), json!(count));
+    Ok(Reply::json(200, state.record(raise)?))
+}
+
 fn handle_events(state: &QueueState, q: &HashMap<String, String>) -> Result<Reply> {
     let since: u64 = q
         .get("since")
@@ -409,22 +542,40 @@ fn handle_events(state: &QueueState, q: &HashMap<String, String>) -> Result<Repl
         .context("bad limit")?
         .unwrap_or(EVENTS_PAGE_LIMIT)
         .min(EVENTS_PAGE_LIMIT);
-    let start = state
-        .events
-        .partition_point(|e| e["seq"].as_u64().unwrap_or(0) <= since);
-    Ok(Reply::lines(state.events[start..].iter().take(limit)))
+    let seq_of = |i: usize| state.events[i]["seq"].as_u64().unwrap_or(0);
+    let Some(queue) = q.get("queue") else {
+        let start = state
+            .events
+            .partition_point(|e| e["seq"].as_u64().unwrap_or(0) <= since);
+        return Ok(Reply::lines(state.events[start..].iter().take(limit)));
+    };
+    let positions: &[usize] = state.queue_events.get(queue).map_or(&[], Vec::as_slice);
+    let start = positions.partition_point(|&i| seq_of(i) <= since);
+    Ok(Reply::lines(
+        positions[start..]
+            .iter()
+            .take(limit)
+            .map(|&i| &state.events[i]),
+    ))
 }
 
 fn handle_entries(state: &QueueState, q: &HashMap<String, String>) -> Reply {
-    let mut matches: Vec<&Value> = state
-        .entries
-        .values()
-        .filter(|e| {
-            ["repo", "kind", "state", "id"]
-                .iter()
-                .all(|f| q.get(*f).is_none_or(|want| str_field(e, f) == want))
-        })
-        .collect();
+    let wanted = |e: &&Value| {
+        ["repo", "kind", "state", "id", "group"]
+            .iter()
+            .all(|f| q.get(*f).is_none_or(|want| str_field(e, f) == want))
+    };
+    let mut matches: Vec<&Value> = match q.get("queue") {
+        Some(name) => state
+            .by_queue
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|k| state.entries.get(k))
+            .filter(wanted)
+            .collect(),
+        None => state.entries.values().filter(wanted).collect(),
+    };
     matches.sort_by_key(|e| e["seq"].as_u64());
     Reply::lines(matches.into_iter())
 }
@@ -557,9 +708,18 @@ fn snapshot(t: &Ticket) -> Value {
     })
 }
 
+/// Queue for pushed tickets: `TK_QUEUE_NAME`, else the server keeps the
+/// ticket's current queue (a new ticket goes to `default`).
+fn queue_name_env() -> Option<String> {
+    std::env::var("TK_QUEUE_NAME")
+        .ok()
+        .filter(|q| !q.is_empty())
+}
+
 fn push_ticket(storage: &Storage, id: &str, op: &str, raise_id: Option<&str>) -> Result<()> {
     let ticket = storage.read(id)?;
     let body = json!({
+        "queue": queue_name_env(),
         "repo": repo_name(storage),
         "id": id,
         "op": op,
@@ -597,6 +757,8 @@ pub struct RaiseOptions {
     pub priority: Option<u8>,
     pub assignee: Option<String>,
     pub tags: Option<String>,
+    pub queue: Option<String>,
+    pub group: Option<String>,
 }
 
 pub fn cmd_raise(o: RaiseOptions) -> Result<()> {
@@ -616,14 +778,33 @@ pub fn cmd_raise(o: RaiseOptions) -> Result<()> {
         "assignee": o.assignee,
         "tags": o.tags.as_deref().map(split_tags).unwrap_or_default(),
         "host": host_name(),
+        "queue": o.queue,
+        "group": o.group,
     });
     let entry: Value = serde_json::from_str(&api("POST", "/raise", Some(&body))?)?;
     println!("{}", str_field(&entry, "id"));
+    let count = entry["count"].as_u64().unwrap_or(1);
+    if count > 1 {
+        eprintln!(
+            "Group {} raised again: occurrence {} of {}",
+            str_field(&entry, "group"),
+            count,
+            str_field(&entry, "id")
+        );
+    }
     Ok(())
 }
 
-pub fn cmd_ls(repo: Option<String>, kind: Option<String>, as_json: bool) -> Result<()> {
+pub fn cmd_ls(
+    queue: Option<String>,
+    repo: Option<String>,
+    kind: Option<String>,
+    as_json: bool,
+) -> Result<()> {
     let mut path = "/entries?".to_string();
+    if let Some(q) = queue {
+        path.push_str(&format!("queue={}&", http::percent_encode(&q)));
+    }
     if let Some(r) = repo {
         path.push_str(&format!("repo={}&", http::percent_encode(&r)));
     }
@@ -638,16 +819,25 @@ pub fn cmd_ls(repo: Option<String>, kind: Option<String>, as_json: bool) -> Resu
     for e in parse_lines(&text)? {
         let ticket = &e["ticket"];
         let state = if str_field(&e, "kind") == "raise" {
-            match e.get("ticket_id").and_then(Value::as_str) {
-                Some(t) => format!("raise {} -> {}", str_field(&e, "state"), t),
-                None => format!("raise {}", str_field(&e, "state")),
+            let mut s = format!("raise {}", str_field(&e, "state"));
+            if let Some(t) = e.get("ticket_id").and_then(Value::as_str) {
+                s.push_str(&format!(" -> {}", t));
             }
+            if let Some(g) = e.get("group").and_then(Value::as_str) {
+                s.push_str(&format!(
+                    ", group {} x{}",
+                    g,
+                    e["count"].as_u64().unwrap_or(1)
+                ));
+            }
+            s
         } else {
             str_field(ticket, "status").to_string()
         };
         println!(
-            "{:>5}  {}/{:<12} [{}] {}",
+            "{:>5}  {:<10} {}/{:<12} [{}] {}",
             e["seq"].as_u64().unwrap_or(0),
+            entry_queue(&e),
             str_field(&e, "repo"),
             str_field(&e, "id"),
             state,
@@ -674,6 +864,7 @@ pub struct PollOptions {
     pub exec: Option<String>,
     pub materialize: bool,
     pub cursor: Option<PathBuf>,
+    pub queue: Option<String>,
 }
 
 /// Print queue changes after the cursor as JSONL, forever or `--once`.
@@ -691,10 +882,13 @@ pub fn cmd_poll(o: PollOptions) -> Result<()> {
     }
     let storage = Storage::new(false).ok();
     let cursor_path = o.cursor.clone().unwrap_or_else(|| {
-        let name = storage
+        let mut name = storage
             .as_ref()
             .map(repo_name)
             .unwrap_or_else(|| "no-repo".into());
+        if let Some(ref q) = o.queue {
+            name.push_str(&format!("--{}", q));
+        }
         state_dir().join(format!("cursor-{}", name))
     });
     let mut cursor = match o.since {
@@ -705,11 +899,16 @@ pub fn cmd_poll(o: PollOptions) -> Result<()> {
 
     loop {
         if let (true, Some(s)) = (o.materialize, storage.as_ref()) {
-            if let Err(e) = materialize_pending(s) {
+            if let Err(e) = materialize_pending(s, o.queue.as_deref()) {
                 eprintln!("warning: could not turn queue raises into tickets: {:#}", e);
             }
         }
-        let result = poll_once(&mut cursor, &cursor_path, o.exec.as_deref());
+        let result = poll_once(
+            &mut cursor,
+            &cursor_path,
+            o.queue.as_deref(),
+            o.exec.as_deref(),
+        );
         if o.once {
             return result;
         }
@@ -735,9 +934,18 @@ fn warn_if_cursor_ahead(cursor: u64) {
     }
 }
 
-fn poll_once(cursor: &mut u64, cursor_path: &Path, exec: Option<&str>) -> Result<()> {
+fn poll_once(
+    cursor: &mut u64,
+    cursor_path: &Path,
+    queue: Option<&str>,
+    exec: Option<&str>,
+) -> Result<()> {
+    let queue_filter = queue
+        .map(|q| format!("&queue={}", http::percent_encode(q)))
+        .unwrap_or_default();
     loop {
-        let events = parse_lines(&api("GET", &format!("/events?since={}", cursor), None)?)?;
+        let path = format!("/events?since={}{}", cursor, queue_filter);
+        let events = parse_lines(&api("GET", &path, None)?)?;
         let page_full = events.len() >= EVENTS_PAGE_LIMIT;
         for event in &events {
             let line = event.to_string();
@@ -760,6 +968,7 @@ fn run_exec(cmd: &str, event: &Value, line: &str) -> Result<()> {
         .arg("-c")
         .arg(cmd)
         .env("TK_QUEUE_SEQ", event["seq"].to_string())
+        .env("TK_QUEUE_NAME", entry_queue(event))
         .env("TK_QUEUE_REPO", str_field(event, "repo"))
         .env("TK_QUEUE_ID", str_field(event, "id"))
         .env("TK_QUEUE_KIND", str_field(event, "kind"))
@@ -802,31 +1011,130 @@ fn write_cursor(path: &Path, seq: u64) -> Result<()> {
     fs::rename(&tmp, path).with_context(|| format!("cannot write cursor {}", path.display()))
 }
 
-/// Turn this repo's pending raises into ticket files.
-fn materialize_pending(storage: &Storage) -> Result<()> {
+/// Turn this repo's pending raises into ticket files, and write new
+/// occurrences of grouped raises into the tickets this host made.
+fn materialize_pending(storage: &Storage, queue: Option<&str>) -> Result<()> {
     let repo = repo_name(storage);
     let host = host_name();
-    let text = api(
-        "GET",
-        &format!("/entries?repo={}&kind=raise", http::percent_encode(&repo)),
-        None,
-    )?;
-    for raise in parse_lines(&text)? {
-        let state = str_field(&raise, "state");
-        let mine = state == "claimed" && str_field(&raise, "claimed_by") == host;
-        if state == "pending" || mine {
-            materialize_one(storage, &repo, &host, &raise)?;
+    let mut path = format!("/entries?repo={}&kind=raise", http::percent_encode(&repo));
+    if let Some(q) = queue {
+        path.push_str(&format!("&queue={}", http::percent_encode(q)));
+    }
+    for raise in parse_lines(&api("GET", &path, None)?)? {
+        if let Err(e) = handle_raise_entry(storage, &repo, &host, &raise) {
+            eprintln!("warning: queue raise {}: {:#}", str_field(&raise, "id"), e);
         }
     }
     Ok(())
 }
 
-fn materialize_one(storage: &Storage, repo: &str, host: &str, raise: &Value) -> Result<()> {
+fn handle_raise_entry(storage: &Storage, repo: &str, host: &str, raise: &Value) -> Result<()> {
+    let state = str_field(raise, "state");
+    let claimed_by_me = str_field(raise, "claimed_by") == host;
+    let ticket_id = match state {
+        "pending" => materialize_one(storage, repo, host, raise)?,
+        "claimed" if claimed_by_me => materialize_one(storage, repo, host, raise)?,
+        "materialized" if claimed_by_me => raise
+            .get("ticket_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    };
+    match ticket_id {
+        Some(t) => note_occurrences(storage, repo, raise, &t),
+        None => Ok(()),
+    }
+}
+
+/// Append one note for the occurrences of a grouped raise that the ticket
+/// does not show yet. A closed ticket is reopened (a regression): closed
+/// means fixed, and `tk ready`/`ls --open` would hide a flag on a closed one.
+fn note_occurrences(storage: &Storage, repo: &str, raise: &Value, ticket_id: &str) -> Result<()> {
+    let count = raise["count"].as_u64().unwrap_or(1);
+    let noted = raise["noted"].as_u64().unwrap_or(1);
+    if count <= noted {
+        return Ok(());
+    }
+    let raise_id = str_field(raise, "id");
+    let marker = format!("{}{} occurrence {}", RAISE_REF_PREFIX, raise_id, count);
+    let ticket = storage.read(ticket_id)?;
+    let already_written = ticket
+        .data
+        .notes
+        .iter()
+        .flatten()
+        .any(|n| n.body.contains(&marker));
+
+    let mut op = "occurrence";
+    if !already_written {
+        let reopen = !ticket.metadata.open;
+        if reopen {
+            storage.update_field(ticket_id, "open", "true")?;
+            storage.update_field(ticket_id, "status", "open")?;
+            op = "regression";
+        }
+        storage.add_note(
+            ticket_id,
+            &occurrence_note(raise, count - noted, count, &marker, reopen),
+        )?;
+        eprintln!(
+            "{} {}: group raised again ({} in all)",
+            if reopen { "Reopened" } else { "Noted" },
+            ticket_id,
+            count
+        );
+    }
+    push_ticket(storage, ticket_id, op, None)?;
+    api(
+        "POST",
+        "/noted",
+        Some(&json!({ "repo": repo, "id": raise_id, "count": count })),
+    )
+    .map(|_| ())
+}
+
+fn occurrence_note(raise: &Value, new: u64, count: u64, marker: &str, reopened: bool) -> String {
+    let latest = &raise["latest"];
+    let mut note = String::new();
+    if reopened {
+        note.push_str(
+            "Regression: this ticket was closed and its group raised again, so it is reopened.\n\n",
+        );
+    }
+    note.push_str(&format!(
+        "Raised again {} time(s), {} in all ({}). Latest from host {} at {}: {}",
+        new,
+        count,
+        marker,
+        str_field(latest, "host"),
+        str_field(latest, "at"),
+        str_field(latest, "title")
+    ));
+    let evidence = str_field(latest, "description");
+    if !evidence.is_empty() {
+        let mut short: String = evidence.chars().take(NOTE_EVIDENCE_CHARS).collect();
+        if short.len() < evidence.len() {
+            short.push_str(" [...]");
+        }
+        note.push_str("\n\n");
+        note.push_str(&short);
+    }
+    note
+}
+
+/// Claim a raise and create its ticket; returns the ticket id, or None when
+/// another poller holds the claim.
+fn materialize_one(
+    storage: &Storage,
+    repo: &str,
+    host: &str,
+    raise: &Value,
+) -> Result<Option<String>> {
     let raise_id = str_field(raise, "id");
     let claim = json!({ "repo": repo, "id": raise_id, "host": host });
     if let Err(e) = api("POST", "/claim", Some(&claim)) {
         eprintln!("note: skipping raise {}: {:#}", raise_id, e);
-        return Ok(());
+        return Ok(None);
     }
 
     let external_ref = format!("{}{}", RAISE_REF_PREFIX, raise_id);
@@ -840,7 +1148,7 @@ fn materialize_one(storage: &Storage, repo: &str, host: &str, raise: &Value) -> 
     };
     push_ticket(storage, &ticket_id, "create", Some(raise_id))?;
     eprintln!("Created {} from queue raise {}", ticket_id, raise_id);
-    Ok(())
+    Ok(Some(ticket_id))
 }
 
 fn create_from_raise(storage: &Storage, raise: &Value, external_ref: String) -> Result<String> {
