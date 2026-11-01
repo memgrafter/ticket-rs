@@ -179,9 +179,9 @@ Commit these files. Diff them. Review them. They're just text.
 | `dep-tree <id>` | `--full` | Box-drawing dependency tree |
 | `dep-cycle` | | Find cycles (open tickets only) |
 | `queue serve` | `--port` (7878), `--data` | Queue server on 127.0.0.1 only |
-| `queue raise <title>` | `--repo, -d, -t, -p, -a, --tags` | Raise a ticket for a repo's poller to create; prints raise id. No `.tickets` needed |
-| `queue poll` | `--since N, --once, --interval N` (30), `--exec CMD, --no-materialize, --cursor PATH` | Print queue changes as JSONL, save cursor; in a repo, first create tickets from its pending raises |
-| `queue ls` | `--repo, --kind ticket\|raise, --json` | Current entries (one per repo + id) |
+| `queue raise <title>` | `--repo, --queue, --group, -d, -t, -p, -a, --tags` | Raise a ticket for a repo's poller to create; prints raise id. No `.tickets` needed |
+| `queue poll` | `--queue, --since N, --once, --interval N` (30), `--exec CMD, --no-materialize, --cursor PATH` | Print queue changes as JSONL, save cursor; in a repo, first create tickets from its pending raises |
+| `queue ls` | `--queue, --repo, --kind ticket\|raise, --json` | Current entries (one per repo + id) |
 | `queue show <id>` | `--repo` | One entry as JSON |
 
 ## Queue (optional, polled)
@@ -189,15 +189,20 @@ Commit these files. Diff them. Review them. They're just text.
 Off unless `TK_QUEUE_URL` is set; then `create`, `status`/`start`/`close`/`reopen`, `add-note`, `dep`/`undep`, `link`/`unlink` also send the changed ticket to the queue. If the queue is down, the ticket file is still saved and tk prints a warning.
 
 ```sh
-# Repo host (Mac): server + reverse tunnel so vert's 127.0.0.1:7878 reaches it
-tk queue serve                       # log: ~/.local/state/tk/queue.jsonl
-ssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:7878:127.0.0.1:7878 vert
+# Repo host (Mac): install tk, then run server + reverse tunnel to vert as launchd agents
+setup/install.sh                     # release build, atomic install to ~/.local/bin/tk
+setup/queue.sh install               # also: uninstall, status. Logs: ~/Library/Logs/tk/
 export TK_QUEUE_URL=http://127.0.0.1:7878
+
+# By hand instead of launchd
+tk queue serve                       # log: ~/.tickets/_global_queue.jsond
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -R 127.0.0.1:7878:127.0.0.1:7878 vert
 
 # Host with no tk and no .tickets (only curl)
 curl -fsS -H 'X-TK-Queue: 1' --data-urlencode repo=my-project \
   --data-urlencode 'title=Batch job 17 failed' --data-urlencode "description=$log" \
   --data-urlencode type=bug --data-urlencode priority=1 --data-urlencode tags=batch \
+  --data-urlencode queue=trellis --data-urlencode group=cuda-oom \
   http://127.0.0.1:7878/raise
 
 # Repo root: create tickets from raises, print changes, run a command per change
@@ -206,14 +211,17 @@ tk queue poll --interval 30 --exec 'cat >> ~/queue-events.jsonl'
 ```
 
 - Entries are keyed by repo + id; every change gets a new `seq`. Repo = name of the dir holding `.tickets` (`TK_QUEUE_REPO` overrides).
+- Queue name: free-form, default `default`. `--queue` filters `ls`/`poll` and picks a raise's queue; pushed tickets keep their queue (`TK_QUEUE_NAME` sets it). A ticket made from a raise joins the raise's queue.
+- Groups (like Sentry issues): the first raise of a queue + repo + `group` makes the ticket; later ones add `count`, `last_seen`, `latest` to that entry, and the poller adds one note per poll to the same ticket. A closed ticket whose group raises again is reopened (regression). No group = one ticket per raise.
+- Log: `~/.tickets/_global_queue.jsond` (NDJSON, append + fsync before the reply). tk never uses `~/.tickets` as a project's ticket dir.
 - Raises are created by a poller whose repo name matches, with `external-ref: queue:<raise id>` (no duplicates on retry; one poller wins via a claim).
 - `--exec` gets the change JSON on stdin and `TK_QUEUE_SEQ`, `TK_QUEUE_REPO`, `TK_QUEUE_ID`, `TK_QUEUE_KIND`, `TK_QUEUE_OP`. If it fails, the poll stops and the cursor stays before that change.
 - Cursor: `~/.local/state/tk/cursor-<repo>` (`TK_QUEUE_STATE_DIR` moves it). Host name: `hostname` (`TK_QUEUE_HOST` overrides).
-- HTTP: `GET /health`, `/events?since=N`, `/entries?repo=&kind=&state=`, `/entry?id=&repo=`; `POST /raise`, `/push`, `/claim` (form or JSON). `Host` must be 127.0.0.1 or localhost, and POST needs `X-TK-Queue: 1` (blocks browser pages). No other auth: anyone who can reach the port can write.
+- HTTP: `GET /health`, `/events?since=N&queue=`, `/entries?queue=&repo=&kind=&state=&group=`, `/entry?id=&repo=`; `POST /raise`, `/push`, `/claim`, `/noted` (form or JSON). `Host` must be 127.0.0.1 or localhost, and POST needs `X-TK-Queue: 1` (blocks browser pages). No other auth: anyone who can reach the port can write.
 
 ## Config / Directory resolution
 
-`tk` looks for `.tickets/` by walking up parent directories. Override with `TICKETS_DIR` env var. Run `tk create` from a project root to initialize `.tickets/` there — works from any subdirectory.
+`tk` looks for `.tickets/` by walking up parent directories. Override with `TICKETS_DIR` env var. `$HOME/.tickets` is skipped (it holds the queue log), and `tk create` refuses to make it. Run `tk create` from a project root to initialize `.tickets/` there — works from any subdirectory.
 
 ## Credits
 

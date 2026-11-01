@@ -44,8 +44,8 @@ When you need to track work items, dependencies, or blockers without leaving the
 | Dep tree | `tk dep-tree <id> [--full]` |
 | Detect cycles | `tk dep-cycle` |
 | Queue: watch changes | `tk queue poll --once` (JSONL; needs `TK_QUEUE_URL`) / `tk queue poll --interval 30 --exec CMD` |
-| Queue: raise without a repo | `tk queue raise "Title" --repo NAME [-d text]` |
-| Queue: inspect | `tk queue ls [--repo R]` / `tk queue show <id>` |
+| Queue: raise without a repo | `tk queue raise "Title" --repo NAME [--queue Q] [--group G] [-d text]` |
+| Queue: inspect | `tk queue ls [--queue Q] [--repo R]` / `tk queue show <id>` |
 | Help | `tk --help` / `tk <cmd> --help` |
 
 ## Example session
@@ -84,7 +84,7 @@ tk query '.status == "open" and .deps != []'
 
 ## Queue (optional)
 
-With `TK_QUEUE_URL=http://127.0.0.1:7878` set, every ticket change is also sent to a `tk queue serve` server; failures only warn. Scripts on other hosts raise tickets with `curl -H 'X-TK-Queue: 1' --data-urlencode repo=R --data-urlencode title=... http://127.0.0.1:7878/raise` (through an ssh tunnel). Run `tk queue poll` from the repo root: it creates those tickets and prints changes. See README "Queue".
+With `TK_QUEUE_URL=http://127.0.0.1:7878` set, every ticket change is also sent to a `tk queue serve` server; failures only warn. Scripts on other hosts raise tickets with `curl -H 'X-TK-Queue: 1' --data-urlencode repo=R --data-urlencode title=... http://127.0.0.1:7878/raise` (through an ssh tunnel). Run `tk queue poll` from the repo root: it creates those tickets and prints changes. Raises with the same `group` go to one ticket as occurrence notes (a closed one is reopened). `--queue NAME` separates streams. See README "Queue".
 
 ## Common pitfalls
 
