@@ -5,7 +5,9 @@
 
 mod display;
 mod graph;
+mod http;
 mod id;
+mod queue;
 mod storage;
 pub mod types;
 
@@ -192,6 +194,78 @@ enum Command {
     },
     /// Find dependency cycles
     DepCycle,
+    /// Networked ticket queue (mirror of ticket changes; set TK_QUEUE_URL)
+    #[command(subcommand)]
+    Queue(QueueCommand),
+}
+
+#[derive(Subcommand)]
+enum QueueCommand {
+    /// Run the queue server on 127.0.0.1 (other hosts: ssh tunnel)
+    Serve {
+        /// Port on 127.0.0.1 (0 = any free port)
+        #[arg(long, default_value_t = queue::DEFAULT_PORT)]
+        port: u16,
+        /// Append-only JSONL log (default ~/.local/state/tk/queue.jsonl)
+        #[arg(long)]
+        data: Option<std::path::PathBuf>,
+    },
+    /// Put a new ticket in the queue for a repo's poller to create (no .tickets needed); prints the raise id
+    Raise {
+        title: String,
+        /// Repo whose poller creates the ticket (default: this repo)
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(short = 'd', long)]
+        description: Option<String>,
+        #[arg(short = 't', long)]
+        issue_type: Option<String>,
+        #[arg(short = 'p', long, value_parser = clap::value_parser!(u8).range(0..=4))]
+        priority: Option<u8>,
+        #[arg(short = 'a', long)]
+        assignee: Option<String>,
+        /// Comma-separated tags
+        #[arg(long)]
+        tags: Option<String>,
+    },
+    /// Print queue changes after the cursor as JSONL; where a .tickets dir is found, first create tickets from its pending raises
+    Poll {
+        /// Start after this seq instead of the saved cursor
+        #[arg(long)]
+        since: Option<u64>,
+        /// Poll once and exit (non-zero if the queue or --exec failed)
+        #[arg(long)]
+        once: bool,
+        /// Seconds between polls
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
+        /// Shell command run per change (change JSON on stdin; TK_QUEUE_SEQ/REPO/ID/KIND/OP set)
+        #[arg(long)]
+        exec: Option<String>,
+        /// Don't create tickets from pending raises
+        #[arg(long)]
+        no_materialize: bool,
+        /// Cursor file (default ~/.local/state/tk/cursor-<repo>)
+        #[arg(long)]
+        cursor: Option<std::path::PathBuf>,
+    },
+    /// List current queue entries (one per repo + id)
+    Ls {
+        #[arg(long)]
+        repo: Option<String>,
+        /// ticket or raise
+        #[arg(long)]
+        kind: Option<String>,
+        /// Print JSONL
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one queue entry as JSON
+    Show {
+        id: String,
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -252,6 +326,47 @@ fn main() -> Result<()> {
         Command::DepTree { id, full } => cmd_dep_tree(&id, full),
         Command::Migrate => cmd_migrate(),
         Command::DepCycle => cmd_dep_cycle(),
+        Command::Queue(q) => cmd_queue(q),
+    }
+}
+
+fn cmd_queue(q: QueueCommand) -> Result<()> {
+    match q {
+        QueueCommand::Serve { port, data } => queue::serve(port, data),
+        QueueCommand::Raise {
+            title,
+            repo,
+            description,
+            issue_type,
+            priority,
+            assignee,
+            tags,
+        } => queue::cmd_raise(queue::RaiseOptions {
+            title,
+            repo,
+            description,
+            issue_type,
+            priority,
+            assignee,
+            tags,
+        }),
+        QueueCommand::Poll {
+            since,
+            once,
+            interval,
+            exec,
+            no_materialize,
+            cursor,
+        } => queue::cmd_poll(queue::PollOptions {
+            since,
+            once,
+            interval,
+            exec,
+            materialize: !no_materialize,
+            cursor,
+        }),
+        QueueCommand::Ls { repo, kind, json } => queue::cmd_ls(repo, kind, json),
+        QueueCommand::Show { id, repo } => queue::cmd_show(&id, repo),
     }
 }
 
@@ -302,6 +417,7 @@ fn cmd_create(
 
     let id = storage.create(&opts)?;
     println!("{}", id);
+    queue::mirror(&storage, &[&id], "create");
     Ok(())
 }
 
@@ -311,6 +427,7 @@ fn cmd_status(id: &str, new_status: &str) -> Result<()> {
     let _ = storage.read(&resolved)?;
     storage.update_field(&resolved, "status", new_status)?;
     println!("Updated {} status -> {}", resolved, new_status);
+    queue::mirror(&storage, &[&resolved], "status");
     Ok(())
 }
 
@@ -333,6 +450,7 @@ fn set_lifecycle(id: &str, open: bool, status: &str) -> Result<()> {
     storage.update_field(&resolved, "open", if open { "true" } else { "false" })?;
     storage.update_field(&resolved, "status", status)?;
     println!("Updated {} -> open: {}, status: {}", resolved, open, status);
+    queue::mirror(&storage, &[&resolved], "status");
     Ok(())
 }
 
@@ -379,6 +497,7 @@ fn cmd_dep_add(id: &str, dep_id: &str) -> Result<()> {
     storage.update_field(&resolved_id, "deps", &yaml)?;
 
     println!("Added dependency: {} -> {}", resolved_id, resolved_dep);
+    queue::mirror(&storage, &[&resolved_id], "dep");
     Ok(())
 }
 
@@ -402,6 +521,7 @@ fn cmd_dep_remove(id: &str, dep_id: &str) -> Result<()> {
     storage.update_field(&resolved_id, "deps", &yaml)?;
 
     println!("Removed dependency: {} -/-> {}", resolved_id, resolved_dep);
+    queue::mirror(&storage, &[&resolved_id], "undep");
     Ok(())
 }
 
@@ -462,23 +582,25 @@ fn load_links(storage: &Storage, ids: &[String]) -> Result<(Vec<String>, LinkMap
 }
 
 /// Write back the `links` field of each ticket whose links changed.
-fn save_links(
+fn save_links<'a>(
     storage: &Storage,
-    order: &[String],
+    order: &'a [String],
     before: &LinkMap,
     after: &LinkMap,
-) -> Result<()> {
-    let mut written: Vec<&String> = Vec::new();
+) -> Result<Vec<&'a str>> {
+    let mut seen: Vec<&String> = Vec::new();
+    let mut changed = Vec::new();
     for id in order {
-        if written.contains(&id) {
+        if seen.contains(&id) {
             continue;
         }
-        written.push(id);
+        seen.push(id);
         if before[id] != after[id] {
             storage.update_field(id, "links", &format_yaml_array(&after[id]))?;
+            changed.push(id.as_str());
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn cmd_link(ids: &[String], all_pairs: bool) -> Result<()> {
@@ -505,11 +627,12 @@ fn cmd_link(ids: &[String], all_pairs: bool) -> Result<()> {
         println!("Added link: {} <-> {}", a, b);
         added += 1;
     }
-    save_links(&storage, &resolved, &before, &after)?;
+    let changed = save_links(&storage, &resolved, &before, &after)?;
 
     if pairs.len() > 1 {
         println!("Added {} link(s); {} already existed", added, existing);
     }
+    queue::mirror(&storage, &changed, "link");
     Ok(())
 }
 
@@ -531,11 +654,12 @@ fn cmd_unlink(ids: &[String], all_pairs: bool) -> Result<()> {
         println!("Removed link: {} <-> {}", a, b);
         removed += 1;
     }
-    save_links(&storage, &resolved, &before, &after)?;
+    let changed = save_links(&storage, &resolved, &before, &after)?;
 
     if pairs.len() > 1 {
         println!("Removed {} link(s); {} were not linked", removed, missing);
     }
+    queue::mirror(&storage, &changed, "unlink");
     Ok(())
 }
 
@@ -753,6 +877,7 @@ fn cmd_add_note(id: &str, text: Option<String>) -> Result<()> {
 
     storage.add_note(&resolved, &body)?;
     println!("Note added to {}", resolved);
+    queue::mirror(&storage, &[&resolved], "note");
     Ok(())
 }
 

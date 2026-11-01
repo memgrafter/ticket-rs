@@ -18,7 +18,7 @@ case "$MODE" in
         cargo test --bin tk 2>&1
         echo ""
         echo "--- Integration tests ---"
-        cargo test --test integration 2>&1
+        cargo test --test integration --test queue 2>&1
         echo ""
         echo "--- Clippy ---"
         cargo clippy -- -D warnings 2>&1 || true
