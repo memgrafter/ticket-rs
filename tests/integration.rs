@@ -22,6 +22,7 @@ fn tk(dir: &Path, args: &[&str]) -> Output {
     Command::new(&bin)
         .args(args)
         .current_dir(dir)
+        .env_remove("TK_QUEUE_URL")
         .output()
         .expect("Failed to run tk command")
 }
