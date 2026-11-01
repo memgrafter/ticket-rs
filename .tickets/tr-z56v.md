@@ -39,3 +39,32 @@ If we outgrow this: an external free-software broker (e.g. NATS JetStream, Valke
 - Tests for the new commands (integration tests in tests/), including a two-client test and failure cases (server down -> create still works and says the queue push failed).
 - Update README/AGENTS.md/SKILL.md for the new commands. Small focused commits; never git add -A; never push.
 
+## Notes
+
+**2026-11-01T15:27:58Z**
+
+Decision (agent, 2026-11-01): option (a) `tk queue serve`, a small HTTP server inside tk with an append-only JSONL log. Tentative until the owner reviews; nothing is installed.
+
+Comparison (checked: vert has curl, wget, python3, socat, nc, flock; no tk, no cargo. The Mac reaches vert with `ssh vert`; vert -> Mac ssh is not known to work):
+
+| | (a) HTTP server + JSONL log | (b) spool dir over ssh |
+|---|---|---|
+| Change sequence | one process assigns seq under one lock: simple, total order | needs a cross-host lock; macOS has no `flock` CLI; time-named files reorder with clock skew |
+| vert raises with tools it has | `curl --data-urlencode` through an ssh tunnel; no JSON escaping in bash | shell `printf` + `mv`; the script must write valid JSON or a custom format |
+| Mac `tk create`/update cost | one loopback HTTP call; fails fast (connection refused) when down | one ssh per command if the spool is remote (slow, can hang without ConnectTimeout) |
+| Long-running pieces | server + one `ssh -N -R` tunnel (both started from the Mac) | only the poller |
+| vert reads entry state (did my raise become a ticket?) | `curl /entry?...` | `ssh`/`cat` of files |
+| New deps | serde_json (already in Cargo.lock as a transitive dep) | none for writing; serde_json or a hand parser for reading |
+| Tests | spawn `tk queue serve --port 0` on 127.0.0.1 | need an ssh stand-in |
+
+Dominant criterion: one total order of changes (the poll cursor depends on it). Tie-breaker: vert can raise with curl and no JSON escaping. Accepting: a server and a tunnel must be kept running; when they are down, `tk create` still works and prints a warning, and vert's curl fails (its script must retry or spool).
+
+Shape:
+- Server: `tk queue serve [--port 7878] [--data FILE]`, binds 127.0.0.1 only (no flag to change it). Storage: append-only JSONL, one line per change (full entry snapshot + seq); state rebuilt by replay at start. One request at a time, socket timeouts, body size cap. No auth: anyone who can reach 127.0.0.1:port on the Mac or on vert (via the tunnel) can write.
+- Client config: env `TK_QUEUE_URL` (e.g. http://127.0.0.1:7878). Unset = today's behaviour, no network. Optional `TK_QUEUE_REPO` overrides the repo name (default: name of the dir that holds .tickets).
+- Mirror: create/start/close/reopen/status/add-note/dep/undep/link/unlink push a snapshot of each changed ticket (key = repo + id). Push failure = warning on stderr, exit 0.
+- Raise: `POST /raise` (form or JSON: repo, title, description, type, priority, tags, assignee, host) and `tk queue raise` for hosts with tk. The poller in the matching repo claims the raise, creates the ticket (external-ref `queue:<raise id>` keeps it idempotent), and the raise entry records the new ticket id.
+- `tk queue poll [--since SEQ] [--once] [--interval N] [--exec CMD] [--no-materialize]`: JSONL events, cursor file under ~/.local/state/tk (override with --cursor or TK_QUEUE_STATE_DIR). `tk queue ls`, `tk queue show <id>`.
+- HTTP client and server are hand-written on std::net (small HTTP/1.1 subset, Connection: close) to avoid an HTTP crate.
+
+New crate: serde_json 1.0.x (licence "MIT OR Apache-2.0", from its Cargo.toml). Its deps itoa ("MIT OR Apache-2.0"), memchr ("Unlicense OR MIT"), serde_core ("MIT OR Apache-2.0") and zmij are already in Cargo.lock; zmij licence to be read from its Cargo.toml after fetch.
