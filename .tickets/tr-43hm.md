@@ -3,7 +3,7 @@ id: tr-43hm
 status: open
 open: true
 deps: []
-links: [tr-v181]
+links: [tr-v181, tr-s3yr]
 created: 2026-09-17T21:12:06Z
 type: design
 priority: 2

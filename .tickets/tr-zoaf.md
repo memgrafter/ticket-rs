@@ -1,7 +1,7 @@
 ---
 id: tr-zoaf
-status: open
-open: true
+status: closed
+open: false
 deps: []
 links: [tr-yeuy]
 created: 2026-09-15T18:01:48Z
@@ -68,3 +68,11 @@ ability to express "this ID lives in another store" and to resolve it.
 - Related: tr-yeuy (default mode: store tickets in ~/.tk by project ID with
   manifest mapping) — a project registry there is the natural home for
   resolving bare project names in link targets.
+
+**2026-11-16T22:12:15Z**
+
+2026-11-16: another hand-linked pair: lglmp-jueb (loreblendr-gcp-llm-meter-proxy) and byo-ddpk (byollm), suggestions missing the prompt cache; also lglmp-29yo/lglmp-njpu <-> byo-j7je (tool-call pairing).
+
+**2026-11-24T21:14:36Z**
+
+Closed on the owner's instruction (2026-11-24). The scoped cross-project link feature described above is not built; reopen to build it.

@@ -1,9 +1,9 @@
 ---
 id: tr-s3yr
-status: open
-open: true
+status: closed
+open: false
 deps: []
-links: []
+links: [tr-43hm, tr-9r69, tr-hslg]
 created: 2026-09-24T13:53:51Z
 type: bug
 priority: 1
@@ -64,3 +64,9 @@ Ticket body shapes and what `tk show` must do (current → expected):
       and correctly accounted for, no "broken" connotation)
 - [ ] no "non-standard section" warning for common design-ticket headings
 - [ ] case #5: subsections of rendered sections render too
+
+## Notes
+
+**2026-11-24T21:07:53Z**
+
+Fixed in the working tree (not committed yet). tk show now prints the ticket file exactly as stored, then computed ## Blockers / ## Blocking / ## Children / ## Linked; the non-standard-section warning is gone. tk show <id> <section>... prints only those headings (any ## to ######, case-insensitive, subsections included, duplicates all printed; reserved: frontmatter, title, description, blockers, blocking, children, linked; unknown name exits 1 listing the headings). --short = frontmatter + title + computed sections, no body. --raw = exactly the file. Parser: one fence-aware heading outline (storage::outline), whole-line --- frontmatter split (storage::split_file), duplicate ## sections joined instead of overwritten. Test cases 1-6 from this ticket are covered in tests/integration.rs (freeform_repo tests) and storage unit tests. Still open: the same loss in tk query and the queue mirror, filed as tr-hslg. Close this ticket when the change is committed.
