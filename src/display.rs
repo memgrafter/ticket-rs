@@ -7,171 +7,160 @@
 //! - JSON output for query command
 
 use crate::graph::DependencyGraph;
-use crate::storage::Ticket;
+use crate::storage::{outline, split_file, Section, Ticket};
+use anyhow::{bail, Result};
 use std::collections::HashMap;
 
-/// Format a ticket for display (like `tk show`).
-pub fn format_ticket_show(
-    ticket: &Ticket,
-    open: &HashMap<String, bool>,
-    statuses: &HashMap<String, String>,
-    titles: &HashMap<String, String>,
-    graph: &DependencyGraph,
-    all_tickets: &[Ticket],
-) -> String {
+/// What `tk show` needs from the other tickets to compute the derived sections.
+pub struct ShowContext<'a> {
+    pub open: &'a HashMap<String, bool>,
+    pub statuses: &'a HashMap<String, String>,
+    pub titles: &'a HashMap<String, String>,
+    pub graph: &'a DependencyGraph,
+    pub all_tickets: &'a [Ticket],
+}
+
+/// Sections `tk show` computes from other tickets (not stored in the file), in
+/// print order.
+pub const DERIVED_SECTIONS: [&str; 4] = ["Blockers", "Blocking", "Children", "Linked"];
+
+/// Section names `tk show <id> <section>` accepts besides the file's own
+/// headings. A file heading with the same name wins.
+pub const RESERVED_SECTIONS: [&str; 7] = [
+    "frontmatter",
+    "title",
+    "description",
+    "blockers",
+    "blocking",
+    "children",
+    "linked",
+];
+
+/// `- <id> [<status>] <title>` lines for one derived section; empty if none.
+fn derived_lines(name: &str, ticket: &Ticket, ctx: &ShowContext) -> Vec<String> {
+    let line = |id: &str| {
+        let s = ctx.statuses.get(id).map(|s| s.as_str()).unwrap_or_default();
+        let t = ctx.titles.get(id).map(|t| t.as_str()).unwrap_or("(not found)");
+        format!("- {} [{}] {}", id, s, t)
+    };
+    let id = &ticket.metadata.id;
+    match name {
+        "Blockers" => ctx.graph.blockers(id, ctx.open).iter().map(|b| line(b)).collect(),
+        "Blocking" => ctx
+            .graph
+            .blocking(id, ctx.all_tickets)
+            .into_iter()
+            .filter(|t| t.metadata.open)
+            .map(|t| line(&t.metadata.id))
+            .collect(),
+        "Children" => ctx
+            .graph
+            .children(id, ctx.all_tickets)
+            .into_iter()
+            .map(|t| line(&t.metadata.id))
+            .collect(),
+        "Linked" => ticket.metadata.links.iter().map(|l| line(l)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The non-empty derived sections, each as `## Name` plus its lines.
+fn derived_sections(ticket: &Ticket, ctx: &ShowContext) -> String {
     let mut out = String::new();
+    for name in DERIVED_SECTIONS {
+        let lines = derived_lines(name, ticket, ctx);
+        if !lines.is_empty() {
+            out.push_str(&format!("\n## {}\n{}\n", name, lines.join("\n")));
+        }
+    }
+    out
+}
 
-    // Warn (stderr) when the body uses `##` sections outside the known schema
-    // (Design / Acceptance Criteria / Notes). Their content is parsed but not
-    // retained, so it is silently dropped from this view — make that visible
-    // rather than let `tk show` look like an empty ticket.
-    if !ticket.non_standard_sections.is_empty() {
-        eprintln!(
-            "warning: ticket {} has non-standard section(s) not shown here: {}\n",
-            ticket.metadata.id,
-            ticket
-                .non_standard_sections
-                .iter()
-                .map(|s| format!("## {}", s))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        eprintln!(
-            "  tk only renders: (description before first ##), ## Design, ## Acceptance Criteria, ## Notes.\n"
-        );
-        eprintln!(
-            "  Read the file directly (.tickets/{}.md) for the full body.\n",
-            ticket.metadata.id
-        );
+fn with_newline(s: &str) -> String {
+    let mut s = s.to_string();
+    if !s.is_empty() && !s.ends_with('\n') {
+        s.push('\n');
     }
+    s
+}
 
-    // Frontmatter with enhanced fields
-    out.push_str(&format!("id: {}\n", ticket.metadata.id));
-    out.push_str(&format!("status: {}\n", ticket.metadata.status));
-    out.push_str(&format!("open: {}\n", ticket.metadata.open));
-    out.push_str(&format!(
-        "deps: {}\n",
-        format_id_list(&ticket.metadata.deps, titles)
-    ));
-    out.push_str(&format!(
-        "links: {}\n",
-        format_id_list(&ticket.metadata.links, titles)
-    ));
-    out.push_str(&format!("created: {}\n", ticket.metadata.created));
-    out.push_str(&format!("type: {}\n", ticket.metadata.metadata_type));
-    out.push_str(&format!(
-        "priority: {}\n",
-        ticket.metadata.priority.to_u8()
-    ));
+/// `tk show <id>`: the file exactly as stored, then the derived sections.
+pub fn format_show_full(raw: &str, ticket: &Ticket, ctx: &ShowContext) -> String {
+    with_newline(raw) + &derived_sections(ticket, ctx)
+}
 
-    if let Some(ref a) = ticket.metadata.assignee {
-        out.push_str(&format!("assignee: {}\n", a));
-    }
-    if let Some(ref e) = ticket.metadata.external_ref {
-        out.push_str(&format!("external-ref: {}\n", e));
-    }
-    if let Some(ref p) = ticket.metadata.parent {
-        let parent_title = titles.get(p).map(|t| t.as_str()).unwrap_or("(not found)");
-        out.push_str(&format!("parent: {}  # {}\n", p, parent_title));
-    }
-    if let Some(ref tags) = ticket.metadata.tags {
-        if !tags.is_empty() {
-            out.push_str(&format!("tags: [{}]\n", tags.join(", ")));
+/// `tk show --short <id>`: frontmatter as stored, the title, then the derived
+/// sections. No body.
+pub fn format_show_short(raw: &str, ticket: &Ticket, ctx: &ShowContext) -> Result<String> {
+    let frontmatter = split_file(raw)?.map(|p| p.frontmatter).unwrap_or_default();
+    Ok(format!(
+        "{}# {}\n{}",
+        with_newline(frontmatter),
+        ticket.data.title,
+        derived_sections(ticket, ctx)
+    ))
+}
+
+/// `tk show <id> <section>...`: each requested section in argument order. A
+/// name matches any `##`-`######` heading in the body (case-insensitive,
+/// subsections included, every duplicate printed), else a reserved name.
+pub fn format_show_sections(
+    raw: &str,
+    ticket: &Ticket,
+    ctx: &ShowContext,
+    names: &[String],
+) -> Result<String> {
+    let parts = split_file(raw)?;
+    let (frontmatter, body) = parts.map_or(("", raw), |p| (p.frontmatter, p.body));
+    let lines: Vec<&str> = body.lines().collect();
+    let headings: Vec<Section> = outline(body).into_iter().filter(|s| s.level >= 2).collect();
+
+    let mut pieces: Vec<String> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    for name in names {
+        let want = name.trim().to_lowercase();
+        let found: Vec<&Section> = headings
+            .iter()
+            .filter(|s| s.heading.to_lowercase() == want)
+            .collect();
+        if !found.is_empty() {
+            for s in found {
+                pieces.push(lines[s.start..s.end].join("\n").trim_end().to_string());
+            }
+            continue;
+        }
+        let derived = DERIVED_SECTIONS.iter().find(|d| d.to_lowercase() == want);
+        match (want.as_str(), derived) {
+            (_, Some(d)) => {
+                let l = derived_lines(d, ticket, ctx);
+                let body = if l.is_empty() { "(none)".to_string() } else { l.join("\n") };
+                pieces.push(format!("## {}\n{}", d, body));
+            }
+            ("frontmatter", _) => pieces.push(frontmatter.trim_end().to_string()),
+            ("title", _) => pieces.push(format!("# {}", ticket.data.title)),
+            ("description", _) => {
+                pieces.push(ticket.data.description.clone().unwrap_or_default())
+            }
+            _ => missing.push(name),
         }
     }
 
-    out.push('\n');
-    out.push_str(&format!("# {}\n", ticket.data.title));
-
-    if let Some(ref desc) = ticket.data.description {
-        out.push('\n');
-        out.push_str(desc);
-        out.push('\n');
-    }
-
-    if let Some(ref design) = ticket.data.design {
-        out.push_str("\n## Design\n\n");
-        out.push_str(design);
-        out.push('\n');
-    }
-
-    if let Some(ref acceptance) = ticket.data.acceptance {
-        out.push_str("\n## Acceptance Criteria\n\n");
-        out.push_str(acceptance);
-        out.push('\n');
-    }
-
-    // Blockers section
-    let blockers = graph.blockers(&ticket.metadata.id, open);
-    if !blockers.is_empty() {
-        out.push_str("\n## Blockers\n");
-        for b in &blockers {
-            let s = statuses.get(b).map(|s| s.as_str()).unwrap_or_default();
-            let t = titles.get(b).map(|t| t.as_str()).unwrap_or("(not found)");
-            out.push_str(&format!("- {} [{}] {}\n", b, s, t));
-        }
-    }
-
-    // Blocking section
-    let blocking = graph.blocking(&ticket.metadata.id, all_tickets);
-    let open_blocking: Vec<&Ticket> = blocking
-        .into_iter()
-        .filter(|t| t.metadata.open)
-        .collect();
-    if !open_blocking.is_empty() {
-        out.push_str("\n## Blocking\n");
-        for t in &open_blocking {
-            out.push_str(&format!(
-                "- {} [{}] {}\n",
-                t.metadata.id,
-                t.metadata.status,
-                t.data.title
-            ));
-        }
-    }
-
-    // Children section
-    let children = graph.children(&ticket.metadata.id, all_tickets);
-    if !children.is_empty() {
-        out.push_str("\n## Children\n");
-        for t in &children {
-            out.push_str(&format!(
-                "- {} [{}] {}\n",
-                t.metadata.id,
-                t.metadata.status,
-                t.data.title
-            ));
-        }
-    }
-
-    // Linked section
-    let linked: Vec<&Ticket> = all_tickets
-        .iter()
-        .filter(|t| ticket.metadata.links.contains(&t.metadata.id))
-        .collect();
-    if !linked.is_empty() {
-        out.push_str("\n## Linked\n");
-        for t in &linked {
-            out.push_str(&format!(
-                "- {} [{}] {}\n",
-                t.metadata.id,
-                t.metadata.status,
-                t.data.title
-            ));
-        }
-    }
-
-    // Notes section
-    if let Some(ref notes) = ticket.data.notes {
-        if !notes.is_empty() {
-            out.push_str("\n## Notes\n");
-            for note in notes {
-                out.push_str(&format!("\n**{}**\n\n{}\n", note.timestamp, note.body));
+    if !missing.is_empty() {
+        let mut available: Vec<String> = Vec::new();
+        for s in &headings {
+            if !available.contains(&s.heading) {
+                available.push(s.heading.clone());
             }
         }
+        bail!(
+            "no section {} in {}\n  headings: {}\n  reserved: {}",
+            missing.iter().map(|m| format!("{:?}", m)).collect::<Vec<_>>().join(", "),
+            ticket.metadata.id,
+            if available.is_empty() { "(none)".to_string() } else { available.join(", ") },
+            RESERVED_SECTIONS.join(", ")
+        );
     }
-
-    out
+    Ok(with_newline(&pieces.join("\n\n")))
 }
 
 /// Format a ticket list entry (for ls, ready, blocked, closed).
@@ -213,23 +202,6 @@ pub fn format_ticket_blocked(
         "{:<8} [{}][{}] - {} <- [{}]",
         ticket.metadata.id, priority_str, status_str, ticket.data.title, blocker_str
     )
-}
-
-/// Format a list of IDs with their titles in parentheses.
-fn format_id_list(ids: &[String], titles: &HashMap<String, String>) -> String {
-    if ids.is_empty() {
-        return "[]".to_string();
-    }
-
-    let items: Vec<String> = ids
-        .iter()
-        .map(|id| {
-            let title = titles.get(id).map(|t| t.as_str()).unwrap_or("(unknown)");
-            format!("{} ({})", id, title)
-        })
-        .collect();
-
-    format!("[{}]", items.join(", "))
 }
 
 /// Format a priority number for display.
@@ -298,16 +270,17 @@ fn ticket_to_json(ticket: &Ticket) -> String {
     if let Some(ref desc) = ticket.data.description {
         parts.push(format!(r#""description":"{}""#, json_escape(desc)));
     }
+    // The markdown after the frontmatter exactly as stored: every section,
+    // including ones the fields above do not cover.
+    parts.push(format!(r#""body":"{}""#, json_escape(&ticket.body)));
 
     format!("{{{}}}", parts.join(","))
 }
 
 fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    // serde_json escapes every control character, not just \n \r \t.
+    let quoted = serde_json::to_string(s).expect("a str always serializes");
+    quoted[1..quoted.len() - 1].to_string()
 }
 
 fn json_array(items: &[String]) -> String {
@@ -382,6 +355,7 @@ priority: 2
         assert_eq!(json_escape("hello"), "hello");
         assert_eq!(json_escape("hello\"world"), "hello\\\"world");
         assert_eq!(json_escape("hello\nworld"), "hello\\nworld");
+        assert_eq!(json_escape("form\x0cfeed\x00"), "form\\ffeed\\u0000");
     }
 
     #[test]

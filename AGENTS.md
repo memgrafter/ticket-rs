@@ -13,9 +13,9 @@ Git-backed ticket system. Markdown `.tickets/<id>.md` with YAML frontmatter. Typ
 | `ls` | `--status, -a, -T, --tags, -s` | Filters + full-text search on title. Sort: priority asc, ID asc |
 | `ready\|blocked` | `-a, -T` | Ready = all deps closed. Blocked = ≥1 open dep |
 | `closed` | `--limit=N` (20) | Recently closed, sorted by created DESC |
-| `show <id>` | | Enhanced: blockers/blocking/children/linked sections |
+| `show <id> [section]...` | `--short, --raw` | File verbatim + computed Blockers/Blocking/Children/Linked. Sections: any `##`-`######` heading, case-insensitive, with subsections; reserved names frontmatter, title, description, blockers... Unknown = exit 1 listing headings. `--short` = frontmatter + title + computed. `--raw` = cat |
 | `add-note <id> [text]` | | Timestamped `**<iso>**`. Reads stdin if no text arg |
-| `query [.field==\"val\"]` | | JSONL. Field filter: status, type, priority, assignee |
+| `query [.field==\"val\"]` | | JSONL; `body` = stored markdown after frontmatter. Field filter: status, type, priority, assignee |
 | `dep-tree <id>` | `--full` | Box-drawing. Dedup by default (--full shows all) |
 | `dep-cycle` | | DFS cycle detection on open tickets only |
 | `edit <id>` | | Prints file path (no $EDITOR launch) |
@@ -86,6 +86,6 @@ tags: [ui, backend]
 cargo build -r     # release: target/release/ticket-rs
 ```
 
-Tests: 137 total (45 unit + 78 integration + 14 queue in `tests/queue.rs`, which start `tk queue serve --port 0`).
+Tests: 150 total (48 unit + 88 integration + 14 queue in `tests/queue.rs`, which start `tk queue serve --port 0`).
 
 Setup (macOS): `setup/install.sh` (release build, atomic install to `~/.local/bin/tk`), `setup/queue.sh install|uninstall|status` (launchd agents from `setup/launchd/`: server, ssh tunnel to vert; logs `~/Library/Logs/tk/`). Integration tests find the binary via `CARGO_BIN_EXE_tk`, so `CARGO_TARGET_DIR` works.

@@ -182,7 +182,7 @@ impl Storage {
         let ticket = Ticket {
             metadata,
             data,
-            non_standard_sections: Vec::new(),
+            body: String::new(),
         };
         let content = ticket.to_string();
 
@@ -196,10 +196,13 @@ impl Storage {
 
     /// Read a ticket by full ID.
     pub fn read(&self, id: &str) -> Result<Ticket> {
+        Ticket::parse(&self.read_raw(id)?, id)
+    }
+
+    /// Read a ticket file's content exactly as stored, by full ID.
+    pub fn read_raw(&self, id: &str) -> Result<String> {
         let path = self.ticket_path(id);
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read ticket file {:?}", path))?;
-        Ticket::parse(&content, id)
+        fs::read_to_string(&path).with_context(|| format!("Failed to read ticket file {:?}", path))
     }
 
     /// Read a ticket by partial ID.
@@ -288,11 +291,25 @@ impl Storage {
         let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let note = format!("\n**{}**\n\n{}\n", timestamp, body);
 
-        let new_content = if content.contains("## Notes") {
-            // Append to existing Notes section
-            content.trim_end().to_string() + "\n" + &note
-        } else {
-            content.trim_end().to_string() + "\n\n## Notes\n" + &note
+        // Find a real `## Notes` heading (not the text "## Notes" quoted in a
+        // paragraph or code block) and put the note at the end of that section.
+        let head_len = split_file(&content)?.map_or(0, |p| content.len() - p.body.len());
+        let body = &content[head_len..];
+        let notes = outline(body)
+            .into_iter()
+            .rev()
+            .find(|s| s.level == 2 && s.heading == "Notes");
+        let lines: Vec<&str> = body.lines().collect();
+        let new_content = match notes {
+            None => content.trim_end().to_string() + "\n\n## Notes\n" + &note,
+            Some(s) if s.end == lines.len() => content.trim_end().to_string() + "\n" + &note,
+            Some(s) => format!(
+                "{}{}\n{}\n{}\n",
+                &content[..head_len],
+                lines[..s.end].join("\n").trim_end(),
+                note,
+                lines[s.end..].join("\n").trim_end()
+            ),
         };
 
         fs::write(&path, new_content.as_bytes())
@@ -399,30 +416,147 @@ impl SearchQuery {
 pub struct Ticket {
     pub metadata: Metadata,
     pub data: Data,
-    /// `##` section headings in the body that are not part of the known schema
-    /// (description-before-first-heading / Design / Acceptance Criteria / Notes).
-    /// Their content is parsed but not retained, so `tk show` cannot render it.
-    /// Populated to warn the user instead of silently dropping the text.
-    pub non_standard_sections: Vec<String>,
+    /// The markdown after the frontmatter exactly as stored. `data` holds only
+    /// the known fields; this keeps every section for query and the queue.
+    pub body: String,
+}
+
+/// A ticket file split at its frontmatter delimiters. All three are slices of
+/// the original content, so callers can print any part verbatim.
+pub struct FileParts<'a> {
+    /// The frontmatter block, both `---` lines included.
+    pub frontmatter: &'a str,
+    /// The YAML between the `---` lines.
+    pub yaml: &'a str,
+    /// Everything after the closing `---` line.
+    pub body: &'a str,
+}
+
+/// Split ticket file content into frontmatter and body. The delimiters are
+/// whole `---` lines, so a `---` inside a YAML value does not end the block.
+/// `Ok(None)` when the file has no opening `---`.
+pub fn split_file(content: &str) -> Result<Option<FileParts<'_>>> {
+    let start = content.len() - content.trim_start().len();
+    let mut lines = content[start..].split_inclusive('\n');
+    let first = match lines.next() {
+        Some(l) if l.trim_end() == "---" => l,
+        _ => return Ok(None),
+    };
+    let yaml_start = start + first.len();
+    let mut pos = yaml_start;
+    for line in lines {
+        if line.trim_end() == "---" {
+            let end = pos + line.len();
+            return Ok(Some(FileParts {
+                frontmatter: &content[start..end],
+                yaml: &content[yaml_start..pos],
+                body: &content[end..],
+            }));
+        }
+        pos += line.len();
+    }
+    bail!("Ticket file missing closing --- frontmatter delimiter");
+}
+
+/// One markdown heading in a ticket body and the lines it spans.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Section {
+    /// 1 for `#`, 2 for `##`, ... 6.
+    pub level: usize,
+    /// Heading text as written, without the `#` marks.
+    pub heading: String,
+    /// Index (into `body.lines()`) of the heading line.
+    pub start: usize,
+    /// Exclusive end: the next heading of the same or a higher level, or the
+    /// line count. Subsections are inside the span.
+    pub end: usize,
+}
+
+/// Parse an ATX heading line (`## Text`), allowing up to 3 spaces of indent
+/// as markdown does. Returns (level, text).
+fn heading_of(line: &str) -> Option<(usize, String)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let level = rest.len() - rest.trim_start_matches('#').len();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let text = &rest[level..];
+    if !(text.is_empty() || text.starts_with(' ') || text.starts_with('\t')) {
+        return None;
+    }
+    let text = text.trim();
+    // Optional closing marks: `## Title ##`
+    let stripped = text.trim_end_matches('#');
+    let text = if stripped.len() < text.len() && (stripped.is_empty() || stripped.ends_with(' ')) {
+        stripped.trim_end()
+    } else {
+        text
+    };
+    Some((level, text.to_string()))
+}
+
+/// For each line of `body`, its heading (level, text), or `None` for ordinary
+/// lines. Lines inside ``` or ~~~ fenced code blocks are never headings.
+fn heading_lines(body: &str) -> Vec<Option<(usize, String)>> {
+    let mut fence: Option<(char, usize)> = None;
+    body.lines()
+        .map(|line| {
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            let t = line.trim_start_matches(' ');
+            let marker = t.chars().next().filter(|c| *c == '`' || *c == '~');
+            let run = marker.map_or(0, |c| t.len() - t.trim_start_matches(c).len());
+            match fence {
+                Some((c, n)) => {
+                    if indent <= 3 && marker == Some(c) && run >= n && t[run..].trim().is_empty() {
+                        fence = None;
+                    }
+                    None
+                }
+                None if indent <= 3 && run >= 3 => {
+                    fence = Some((marker.unwrap(), run));
+                    None
+                }
+                None => heading_of(line),
+            }
+        })
+        .collect()
+}
+
+/// All headings in a ticket body, in file order, each with its line span.
+pub fn outline(body: &str) -> Vec<Section> {
+    let heads: Vec<(usize, usize, String)> = heading_lines(body)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, h)| h.map(|(level, text)| (i, level, text)))
+        .collect();
+    let total = body.lines().count();
+    heads
+        .iter()
+        .enumerate()
+        .map(|(k, (start, level, heading))| Section {
+            level: *level,
+            heading: heading.clone(),
+            start: *start,
+            end: heads[k + 1..]
+                .iter()
+                .find(|(_, l, _)| l <= level)
+                .map_or(total, |(i, _, _)| *i),
+        })
+        .collect()
 }
 
 impl Ticket {
     /// Parse a ticket from its file content.
     pub fn parse(content: &str, default_id: &str) -> Result<Self> {
-        let content = content.trim();
-
-        // Split frontmatter and body
-        let (yaml_str, body_str) = if let Some(rest) = content.strip_prefix("---") {
-            if let Some(end_idx) = rest.find("---") {
-                let yaml = rest[..end_idx].trim();
-                let body = rest[end_idx + 3..].trim();
-                (yaml, body)
-            } else {
-                bail!("Ticket file missing closing --- frontmatter delimiter");
-            }
-        } else {
-            ("", content)
+        let (yaml_str, raw_body) = match split_file(content)? {
+            Some(parts) => (parts.yaml.trim(), parts.body),
+            None => ("", content),
         };
+        let body_str = raw_body.trim();
 
         // Parse YAML frontmatter
         let metadata: Metadata = if yaml_str.is_empty() {
@@ -432,13 +566,10 @@ impl Ticket {
             parse_frontmatter(yaml_str, default_id)?
         };
 
-        // Parse body
-        let (data, non_standard_sections) = parse_body(body_str);
-
         Ok(Ticket {
             metadata,
-            data,
-            non_standard_sections,
+            data: parse_body(body_str),
+            body: raw_body.to_string(),
         })
     }
 }
@@ -581,76 +712,63 @@ fn parse_frontmatter(yaml_str: &str, default_id: &str) -> Result<Metadata> {
 }
 
 /// Parse the body of a ticket (markdown after frontmatter).
-fn parse_body(body_str: &str) -> (Data, Vec<String>) {
+fn parse_body(body_str: &str) -> Data {
     let body = body_str.trim();
+    let heads = heading_lines(body);
 
-    // Extract title (first # heading)
-    let title = body
-        .lines()
-        .find(|l| l.trim().starts_with("# "))
-        .map(|l| l.trim().trim_start_matches("# ").to_string())
+    // Title: first `#` heading outside code fences
+    let title = heads
+        .iter()
+        .flatten()
+        .find(|(level, _)| *level == 1)
+        .map(|(_, text)| text.clone())
         .unwrap_or_else(|| "Untitled".to_string());
 
-    // Split into sections
-    let sections = split_sections(body);
-    let description = sections.get("").cloned();
-    let design = sections.get("Design").cloned();
-    let acceptance = sections.get("Acceptance Criteria").cloned();
-    let notes = sections.get("Notes").map(|n| parse_notes(n));
-
-    // Known schema: empty key (description) + these four. Anything else is
-    // parsed but discarded by this struct, so surface it for a display warning.
-    const KNOWN: [&str; 4] = ["", "Design", "Acceptance Criteria", "Notes"];
-    let non_standard: Vec<String> = sections
-        .keys()
-        .filter(|k| !KNOWN.contains(&k.as_str()))
-        .map(|s| s.clone())
-        .collect();
-
-    (
-        Data {
-            title,
-            description,
-            design,
-            acceptance,
-            notes,
-        },
-        non_standard,
-    )
+    // Fill the struct's fields from the matching `##` sections. Display does
+    // not use these (`tk show` prints the file); query, ls and the queue do.
+    let sections = split_sections(body, &heads);
+    let get = |name: &str| sections.get(name).cloned();
+    Data {
+        title,
+        description: get(""),
+        design: get("Design"),
+        acceptance: get("Acceptance Criteria"),
+        notes: get("Notes").map(|n| parse_notes(&n)),
+    }
 }
 
-/// Split body into sections by ## headings.
-fn split_sections(body: &str) -> HashMap<String, String> {
+/// Split body into `##` sections keyed by heading text ("" = text before the
+/// first `##`). `###` and deeper stay inside their section, `#` lines are
+/// dropped, and duplicate headings are joined in file order.
+fn split_sections(body: &str, heads: &[Option<(usize, String)>]) -> HashMap<String, String> {
     let mut sections: HashMap<String, String> = HashMap::new();
-    let mut current_section = String::new();
-    let mut current_content = Vec::new();
-
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("## ") {
-            // Save previous section
-            if !current_content.is_empty() {
-                sections.insert(
-                    current_section.clone(),
-                    current_content.join("\n").trim().to_string(),
-                );
+    let mut save = |name: &str, lines: &[&str]| {
+        let text = lines.join("\n").trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        sections
+            .entry(name.to_string())
+            .and_modify(|s| {
+                s.push_str("\n\n");
+                s.push_str(&text);
+            })
+            .or_insert(text);
+    };
+    let mut current = String::new();
+    let mut content: Vec<&str> = Vec::new();
+    for (line, head) in body.lines().zip(heads) {
+        match head {
+            Some((2, text)) => {
+                save(&current, &content);
+                current = text.clone();
+                content.clear();
             }
-            current_section = trimmed.trim_start_matches("## ").trim().to_string();
-            current_content.clear();
-        } else if trimmed.starts_with("# ") {
-            // Top-level heading, skip (it's the title)
-        } else {
-            current_content.push(line);
+            Some((1, _)) => {}
+            _ => content.push(line),
         }
     }
-
-    if !current_content.is_empty() {
-        sections.insert(
-            current_section.clone(),
-            current_content.join("\n").trim().to_string(),
-        );
-    }
-
+    save(&current, &content);
     sections
 }
 
@@ -1057,5 +1175,44 @@ tags: [ui, backend]
             ..Default::default()
         };
         assert!(!q.matches(&ticket));
+    }
+
+    #[test]
+    fn test_split_file_whole_line_delimiters() {
+        let raw = "---\nid: a-1\nexternal-ref: x---y\n---\n# T\n\nbody\n";
+        let p = split_file(raw).unwrap().unwrap();
+        assert_eq!(p.frontmatter, "---\nid: a-1\nexternal-ref: x---y\n---\n");
+        assert_eq!(p.yaml, "id: a-1\nexternal-ref: x---y\n");
+        assert_eq!(p.body, "# T\n\nbody\n");
+        assert!(split_file("# no frontmatter").unwrap().is_none());
+        assert!(split_file("---\nid: a\n").is_err());
+    }
+
+    #[test]
+    fn test_outline_levels_spans_and_fences() {
+        let body = "# T\n## A\na\n### A1\nx\n```\n## not a heading\n```\n## B\n    ## indented code\nb\n## B ##\n";
+        let o = outline(body);
+        let got: Vec<(usize, &str, usize, usize)> =
+            o.iter().map(|s| (s.level, s.heading.as_str(), s.start, s.end)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, "T", 0, 12),
+                (2, "A", 1, 8),
+                (3, "A1", 3, 8),
+                (2, "B", 8, 11),
+                (2, "B", 11, 12),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_body_duplicates_fences_and_order() {
+        let body = "# Title\n\ndesc\n\n## Design\none\n```\n## Notes\n```\n## Extra\nkept out of design\n## Design\ntwo\n";
+        let d = parse_body(body);
+        assert_eq!(d.title, "Title");
+        assert_eq!(d.description.as_deref(), Some("desc"));
+        assert_eq!(d.design.as_deref(), Some("one\n```\n## Notes\n```\n\ntwo"));
+        assert!(d.notes.is_none());
     }
 }

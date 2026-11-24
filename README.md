@@ -69,7 +69,10 @@ tk blocked                  # open tickets with open deps
 tk closed --limit 5
 
 # Show / edit
-tk show my-project-a1b2
+tk show my-project-a1b2              # the file as stored + computed blockers/children/links
+tk show my-project-a1b2 tasks        # only the "## Tasks" section (any heading, case-insensitive)
+tk show --short my-project-a1b2      # frontmatter, title and computed sections; no body
+tk show --raw my-project-a1b2        # exactly the file, like cat
 tk edit my-project-a1b2     # prints file path
 
 # Add notes
@@ -172,10 +175,10 @@ Commit these files. Diff them. Review them. They're just text.
 | `ready` | `-a, -T` | Tickets ready to work on |
 | `blocked` | `-a, -T` | Tickets waiting on deps |
 | `closed` | `--limit=N` (20), `-a, -T` | Recently closed |
-| `show <id>` | | Full ticket display with deps/links |
+| `show <id> [section]...` | `--short, --raw` | The file as stored plus computed Blockers/Blocking/Children/Linked; with sections, only those headings (case-insensitive; reserved: frontmatter, title, description, blockers, blocking, children, linked). `--short`: no body. `--raw`: file only |
 | `edit <id>` | | Prints file path |
 | `add-note <id> [text]` | | Timestamped note (stdin if no text) |
-| `query [.field=="val"]` | | JSONL output with optional filter |
+| `query [.field=="val"]` | | JSONL output with optional filter; `body` holds the stored markdown after the frontmatter |
 | `dep-tree <id>` | `--full` | Box-drawing dependency tree |
 | `dep-cycle` | | Find cycles (open tickets only) |
 | `queue serve` | `--port` (7878), `--data` | Queue server on 127.0.0.1 only |

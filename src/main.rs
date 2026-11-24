@@ -13,7 +13,10 @@ pub mod types;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use display::{format_ticket_blocked, format_ticket_list, format_ticket_show, format_tickets_jsonl};
+use display::{
+    format_show_full, format_show_sections, format_show_short, format_ticket_blocked,
+    format_ticket_list, format_tickets_jsonl, ShowContext,
+};
 use graph::{render_dep_tree, DependencyGraph};
 use storage::{SearchQuery, Storage, Ticket};
 use std::collections::HashMap;
@@ -166,9 +169,33 @@ enum Command {
         #[arg(short = 'T')]
         tag: Option<String>,
     },
-    /// Display a ticket
+    /// Display a ticket: the file as stored, plus computed sections
+    ///
+    /// Default: the whole file exactly as stored (same as `cat`), then the
+    /// sections tk computes from other tickets: ## Blockers (open deps),
+    /// ## Blocking (open tickets that depend on this one), ## Children,
+    /// ## Linked. Empty computed sections are left out.
+    ///
+    /// With SECTION arguments, prints only those sections, in argument order.
+    /// A SECTION is any heading text in the body (## through ######), matched
+    /// case-insensitively, with its subsections; every duplicate heading is
+    /// printed. Reserved names (a file heading with the same name wins):
+    /// frontmatter, title, description (text before the first ##), blockers,
+    /// blocking, children, linked. An unknown SECTION exits 1 and lists the
+    /// headings the ticket has.
+    ///
+    /// Examples: `tk show ab12`, `tk show ab12 tasks`,
+    /// `tk show ab12 "what to build" notes`, `tk show --short ab12`.
     Show {
         id: String,
+        /// Sections to print (heading text, case-insensitive); omit for the whole file
+        sections: Vec<String>,
+        /// Frontmatter, title and computed sections only; no body
+        #[arg(long, conflicts_with_all = ["raw", "sections"])]
+        short: bool,
+        /// Exactly the file, like `cat`: no computed sections
+        #[arg(long, conflicts_with = "sections")]
+        raw: bool,
     },
     /// Edit a ticket file (prints path for $EDITOR)
     Edit {
@@ -331,7 +358,12 @@ fn main() -> Result<()> {
             assignee,
             tag,
         } => cmd_closed(limit, assignee, tag),
-        Command::Show { id } => cmd_show(&id),
+        Command::Show {
+            id,
+            sections,
+            short,
+            raw,
+        } => cmd_show(&id, &sections, short, raw),
         Command::Edit { id } => cmd_edit(&id),
         Command::AddNote { id, text } => cmd_add_note(&id, text),
         Command::Query { filter } => cmd_query(filter),
@@ -848,10 +880,15 @@ fn cmd_closed(limit: usize, assignee: Option<String>, tag: Option<String>) -> Re
     Ok(())
 }
 
-fn cmd_show(id: &str) -> Result<()> {
+fn cmd_show(id: &str, sections: &[String], short: bool, raw: bool) -> Result<()> {
     let storage = make_storage(false)?;
     let resolved = storage.resolve_id(id)?;
-    let ticket = storage.read(&resolved)?;
+    let content = storage.read_raw(&resolved)?;
+    if raw {
+        print!("{}", content);
+        return Ok(());
+    }
+    let ticket = storage::Ticket::parse(&content, &resolved)?;
     let all_tickets = storage.all()?;
 
     let open_map: HashMap<String, bool> = all_tickets
@@ -867,9 +904,22 @@ fn cmd_show(id: &str) -> Result<()> {
         .map(|t| (t.metadata.id.clone(), t.data.title.clone()))
         .collect();
     let graph = DependencyGraph::build(&all_tickets);
+    let ctx = ShowContext {
+        open: &open_map,
+        statuses: &statuses,
+        titles: &titles,
+        graph: &graph,
+        all_tickets: &all_tickets,
+    };
 
-    let output = format_ticket_show(&ticket, &open_map, &statuses, &titles, &graph, &all_tickets);
-    println!("{}", output.trim_end());
+    let output = if !sections.is_empty() {
+        format_show_sections(&content, &ticket, &ctx, sections)?
+    } else if short {
+        format_show_short(&content, &ticket, &ctx)?
+    } else {
+        format_show_full(&content, &ticket, &ctx)
+    };
+    print!("{}", output);
     Ok(())
 }
 

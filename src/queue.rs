@@ -705,6 +705,7 @@ fn snapshot(t: &Ticket) -> Value {
         "design": t.data.design,
         "acceptance": t.data.acceptance,
         "notes": notes,
+        "body": t.body,
     })
 }
 

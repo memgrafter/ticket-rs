@@ -38,7 +38,8 @@ When you need to track work items, dependencies, or blockers without leaving the
 | List / filter | `tk ls [--status S] [--tags x,y] [-s "search"]` |
 | What's actionable | `tk ready` / `tk blocked` |
 | Recently closed | `tk closed [--limit N]` |
-| Full view | `tk show <id>` |
+| Full view | `tk show <id>`: the file as stored plus computed Blockers/Blocking/Children/Linked. `--short`: frontmatter, title and computed sections, no body. `--raw`: the file only, like `cat` |
+| One section | `tk show <id> <section>...`: any heading text, case-insensitive (`tk show <id> tasks`, `"what to build"`). Reserved: `frontmatter`, `title`, `description`, `blockers`, `blocking`, `children`, `linked` |
 | Add a note | `tk add-note <id> "text"` |
 | Query (JSONL) | `tk query ['.field == "val"']` |
 | Dep tree | `tk dep-tree <id> [--full]` |

@@ -309,6 +309,172 @@ fn test_show_with_partial_id() {
     assert!(out.contains(&id));
 }
 
+/// A ticket body with free-form sections, a fenced heading, a duplicate
+/// heading and hand-written text in Notes (all of which show used to drop).
+const FREEFORM: &str = "---
+id: ff-0001
+status: open
+open: true
+deps: [ff-0002]
+links: [ff-0002]
+created: 2026-01-01T00:00:00Z
+type: task
+priority: 1
+---
+# Free-form ticket
+
+Intro text.
+
+## Design
+
+design one
+
+## Key files
+
+- src/a.rs
+
+### Sub detail
+
+nested text
+
+```sh
+## not a heading
+```
+
+## Tasks
+
+- [ ] write tests
+
+## Design
+
+design two
+
+## Notes
+
+- hand-written note
+
+**2026-01-02T00:00:00Z**
+
+timestamped note
+";
+
+const BLOCKER: &str = "---
+id: ff-0002
+status: open
+open: true
+deps: []
+links: [ff-0001]
+created: 2026-01-01T00:00:00Z
+type: task
+priority: 2
+---
+# Blocker ticket
+";
+
+/// A temp repo holding the FREEFORM ticket (ff-0001) and its blocker (ff-0002).
+fn freeform_repo() -> TicketTest {
+    let t = TicketTest::new();
+    let dir = t.path().join(".tickets");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("ff-0001.md"), FREEFORM).unwrap();
+    fs::write(dir.join("ff-0002.md"), BLOCKER).unwrap();
+    t
+}
+
+fn raw_stdout(t: &TicketTest, args: &[&str]) -> String {
+    let out = t.run(args);
+    assert!(out.status.success(), "tk {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn test_show_prints_whole_file_then_computed_sections() {
+    let t = freeform_repo();
+    let out = t.run(&["show", "ff-0001"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.starts_with(FREEFORM), "show must start with the file verbatim:\n{}", stdout);
+    let rest = &stdout[FREEFORM.len()..];
+    assert!(rest.contains("## Blockers\n- ff-0002 [open] Blocker ticket"), "{}", rest);
+    assert!(rest.contains("## Linked\n- ff-0002 [open] Blocker ticket"), "{}", rest);
+    assert!(String::from_utf8_lossy(&out.stderr).is_empty(), "no warning expected");
+}
+
+#[test]
+fn test_show_raw_is_exactly_the_file() {
+    let t = freeform_repo();
+    assert_eq!(raw_stdout(&t, &["show", "--raw", "ff-0001"]), FREEFORM);
+}
+
+#[test]
+fn test_show_short_has_no_body() {
+    let t = freeform_repo();
+    let out = raw_stdout(&t, &["show", "--short", "ff-0001"]);
+    assert!(out.starts_with("---\nid: ff-0001\n"), "{}", out);
+    assert!(out.contains("# Free-form ticket\n"), "{}", out);
+    assert!(out.contains("## Blockers\n- ff-0002"), "{}", out);
+    assert!(!out.contains("Intro text") && !out.contains("## Key files"), "{}", out);
+}
+
+#[test]
+fn test_show_selected_sections() {
+    let t = freeform_repo();
+    // Case-insensitive, subsections and fenced lines kept, argument order.
+    let out = raw_stdout(&t, &["show", "ff-0001", "key files", "TASKS"]);
+    assert_eq!(
+        out,
+        "## Key files\n\n- src/a.rs\n\n### Sub detail\n\nnested text\n\n```sh\n## not a heading\n```\n\n## Tasks\n\n- [ ] write tests\n"
+    );
+    // Duplicate headings: both printed, file order.
+    let out = raw_stdout(&t, &["show", "ff-0001", "design"]);
+    assert_eq!(out, "## Design\n\ndesign one\n\n## Design\n\ndesign two\n");
+    // A nested heading on its own.
+    let out = raw_stdout(&t, &["show", "ff-0001", "sub detail"]);
+    assert!(out.starts_with("### Sub detail\n\nnested text"), "{}", out);
+    // Notes keep the hand-written text before the first timestamp.
+    let out = raw_stdout(&t, &["show", "ff-0001", "notes"]);
+    assert!(out.contains("- hand-written note") && out.contains("timestamped note"), "{}", out);
+}
+
+#[test]
+fn test_show_reserved_sections() {
+    let t = freeform_repo();
+    assert_eq!(raw_stdout(&t, &["show", "ff-0001", "title"]), "# Free-form ticket\n");
+    assert_eq!(raw_stdout(&t, &["show", "ff-0001", "description"]), "Intro text.\n");
+    assert_eq!(
+        raw_stdout(&t, &["show", "ff-0001", "blockers"]),
+        "## Blockers\n- ff-0002 [open] Blocker ticket\n"
+    );
+    assert_eq!(raw_stdout(&t, &["show", "ff-0001", "children"]), "## Children\n(none)\n");
+    let fm = raw_stdout(&t, &["show", "ff-0001", "frontmatter"]);
+    assert!(fm.starts_with("---\nid: ff-0001") && fm.ends_with("---\n"), "{}", fm);
+}
+
+#[test]
+fn test_show_unknown_section_lists_headings() {
+    let t = freeform_repo();
+    let err = t.run_fail(&["show", "ff-0001", "taks"]);
+    assert!(err.contains("no section \"taks\" in ff-0001"), "{}", err);
+    assert!(err.contains("Design, Key files, Sub detail, Tasks, Notes"), "{}", err);
+}
+
+#[test]
+fn test_query_body_is_the_stored_markdown() {
+    let t = freeform_repo();
+    let out = t.run_ok(&["query"]);
+    let line = out.lines().find(|l| l.contains("\"id\":\"ff-0001\"")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+    let body = FREEFORM.split_once("---\n# ").map(|(_, b)| format!("# {}", b)).unwrap();
+    assert_eq!(v["body"], body.as_str());
+}
+
+#[test]
+fn test_show_help_lists_short_and_raw() {
+    let t = TicketTest::new();
+    let help = t.run_ok(&["show", "--help"]);
+    assert!(help.contains("--short") && help.contains("--raw"), "{}", help);
+    assert!(help.contains("[SECTIONS]..."), "{}", help);
+}
+
 // ---------------------------------------------------------------------------
 // List tests
 // ---------------------------------------------------------------------------
@@ -663,6 +829,42 @@ fn test_add_multiple_notes() {
     let content = t.read_ticket_file(&id);
     assert!(content.contains("First note"));
     assert!(content.contains("Second note"));
+}
+
+#[test]
+fn test_add_note_ignores_quoted_notes_heading() {
+    // "## Notes" inside a sentence and a code block is not a heading: the note
+    // must get its own real `## Notes` heading.
+    let t = TicketTest::new();
+    let dir = t.path().join(".tickets");
+    fs::create_dir(&dir).unwrap();
+    let file = dir.join("qn-0001.md");
+    fs::write(
+        &file,
+        "---\nid: qn-0001\nstatus: open\nopen: true\ndeps: []\nlinks: []\ncreated: 2026-01-01T00:00:00Z\ntype: task\npriority: 2\n---\n# Quoted\n\nRenders only ## Design and ## Notes.\n\n```\n## Notes\n```\n",
+    )
+    .unwrap();
+    t.run_ok(&["add-note", "qn-0001", "real note"]);
+    let notes = t.run_ok(&["show", "qn-0001", "notes"]);
+    assert!(notes.starts_with("## Notes\n") && notes.ends_with("real note"), "{}", notes);
+}
+
+#[test]
+fn test_add_note_goes_into_notes_section_when_not_last() {
+    let t = TicketTest::new();
+    let dir = t.path().join(".tickets");
+    fs::create_dir(&dir).unwrap();
+    let file = dir.join("nl-0001.md");
+    fs::write(
+        &file,
+        "---\nid: nl-0001\nstatus: open\nopen: true\ndeps: []\nlinks: []\ncreated: 2026-01-01T00:00:00Z\ntype: task\npriority: 2\n---\n# Notes first\n\n## Notes\n\n- old note\n\n## References\n\n- a link\n",
+    )
+    .unwrap();
+    t.run_ok(&["add-note", "nl-0001", "new note"]);
+    let notes = t.run_ok(&["show", "nl-0001", "notes"]);
+    assert!(notes.contains("- old note") && notes.ends_with("new note"), "{}", notes);
+    let refs = t.run_ok(&["show", "nl-0001", "references"]);
+    assert_eq!(refs, "## References\n\n- a link");
 }
 
 #[test]

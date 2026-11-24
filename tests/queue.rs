@@ -229,6 +229,10 @@ fn test_queue_create_pushes_entry() {
     assert_eq!(e["ticket"]["type"], "bug");
     assert_eq!(e["ticket"]["priority"], 1);
     assert_eq!(e["ticket"]["tags"][0], "ops");
+    // The whole stored body travels, so free-form sections are not lost.
+    let file = ticket_file(&mac, &id);
+    let body = file.split_once("\n---\n").unwrap().1;
+    assert_eq!(e["ticket"]["body"], body);
 }
 
 #[test]
